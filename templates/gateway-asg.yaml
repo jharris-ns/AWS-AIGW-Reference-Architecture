@@ -1,0 +1,1796 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Netskope AI Gateway - Auto Scaling deployment with ALB.
+  Deploys gateway instances in an ASG with lifecycle hooks for
+  automated enrollment and deregistration.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Netskope Tenant Configuration
+        Parameters:
+          - NetskopeTenantUrl
+          - NetskopeApiToken
+          - DlpHostUrl
+      - Label:
+          default: Network Configuration
+        Parameters:
+          - ExistingVpcId
+          - ExistingPublicSubnetId
+          - ExistingPublicSubnet2Id
+          - ExistingPrivateSubnetId
+          - ExistingPrivateSubnet2Id
+          - VpcCidr
+          - PublicSubnetCidr
+          - PublicSubnet2Cidr
+          - PrivateSubnetCidr
+          - PrivateSubnet2Cidr
+      - Label:
+          default: Gateway Instance Configuration
+        Parameters:
+          - GatewayAmiId
+          - InstanceType
+          - KeyPairName
+          - SshSourceCidr
+      - Label:
+          default: Load Balancer Configuration
+        Parameters:
+          - AcmCertificateArn
+      - Label:
+          default: Auto Scaling Configuration
+        Parameters:
+          - MinCapacity
+          - MaxCapacity
+          - DesiredCapacity
+      - Label:
+          default: Tagging
+        Parameters:
+          - Project
+          - Environment
+    ParameterLabels:
+      NetskopeTenantUrl:
+        default: Netskope Tenant URL
+      NetskopeApiToken:
+        default: Netskope API Token
+      ExistingVpcId:
+        default: Existing VPC ID (optional)
+      ExistingPublicSubnetId:
+        default: Existing Public Subnet ID (AZ 1)
+      VpcCidr:
+        default: New VPC CIDR Block
+      PublicSubnetCidr:
+        default: New Public Subnet CIDR
+      GatewayAmiId:
+        default: Gateway AMI ID
+      InstanceType:
+        default: Gateway Instance Type
+      KeyPairName:
+        default: SSH Key Pair Name
+      SshSourceCidr:
+        default: SSH Source CIDR
+      ExistingPublicSubnet2Id:
+        default: Existing Public Subnet 2 ID (AZ 2)
+      PublicSubnet2Cidr:
+        default: New Public Subnet 2 CIDR
+      ExistingPrivateSubnetId:
+        default: Existing Private Subnet ID (AZ 1)
+      ExistingPrivateSubnet2Id:
+        default: Existing Private Subnet 2 ID (AZ 2)
+      PrivateSubnetCidr:
+        default: New Private Subnet CIDR
+      PrivateSubnet2Cidr:
+        default: New Private Subnet 2 CIDR
+      AcmCertificateArn:
+        default: ACM Certificate ARN
+      MinCapacity:
+        default: Minimum Instances
+      MaxCapacity:
+        default: Maximum Instances
+      DesiredCapacity:
+        default: Desired Instances
+      DlpHostUrl:
+        default: DLP Host URL
+      Project:
+        default: Project Name
+      Environment:
+        default: Environment Name
+
+Parameters:
+  ExistingVpcId:
+    Type: String
+    Default: ''
+    AllowedPattern: '^(vpc-[a-z0-9]+)?$'
+    ConstraintDescription: Must be a valid VPC ID (vpc-xxx) or empty to create a new VPC.
+    Description: 'ID of an existing VPC to deploy into. Leave empty to create a new VPC.'
+
+  ExistingPublicSubnetId:
+    Type: String
+    Default: ''
+    AllowedPattern: '^(subnet-[a-z0-9]+)?$'
+    ConstraintDescription: Must be a valid subnet ID (subnet-xxx) or empty to create a new subnet.
+    Description: 'Existing public subnet for ALB (AZ 1). Leave empty to create new.'
+
+  ExistingPublicSubnet2Id:
+    Type: String
+    Default: ''
+    AllowedPattern: '^(subnet-[a-z0-9]+)?$'
+    ConstraintDescription: Must be a valid subnet ID (subnet-xxx) or empty to create a new subnet.
+    Description: 'Existing public subnet for ALB (AZ 2). Leave empty to create new.'
+
+  AcmCertificateArn:
+    Type: String
+    Description: 'ACM certificate ARN for the ALB HTTPS listener'
+
+  MinCapacity:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    Description: Minimum number of gateway instances
+
+  MaxCapacity:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    Description: Maximum number of gateway instances
+
+  DesiredCapacity:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    Description: Desired number of gateway instances
+
+  NetskopeTenantUrl:
+    Type: String
+    Description: 'Netskope tenant URL (e.g., https://tenant.goskope.com)'
+    AllowedPattern: 'https://.+'
+    ConstraintDescription: Must be a valid HTTPS URL
+
+  NetskopeApiToken:
+    Type: String
+    NoEcho: true
+    Description: Netskope API token for gateway activation
+
+  VpcCidr:
+    Type: String
+    Default: '10.0.0.0/16'
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    ConstraintDescription: Must be a valid CIDR block (e.g., 10.0.0.0/16)
+    Description: CIDR block for the VPC
+
+  PublicSubnetCidr:
+    Type: String
+    Default: '10.0.1.0/24'
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    ConstraintDescription: Must be a valid CIDR block (e.g., 10.0.1.0/24)
+    Description: CIDR block for the public subnet (gateway instance)
+
+  PublicSubnet2Cidr:
+    Type: String
+    Default: '10.0.2.0/24'
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    ConstraintDescription: Must be a valid CIDR block (e.g., 10.0.2.0/24)
+    Description: CIDR block for the second public subnet (different AZ)
+
+  ExistingPrivateSubnetId:
+    Type: String
+    Default: ''
+    AllowedPattern: '^(subnet-[a-z0-9]+)?$'
+    ConstraintDescription: Must be a valid subnet ID (subnet-xxx) or empty to create a new subnet.
+    Description: 'Existing private subnet for gateway instances (AZ 1). Leave empty to create new.'
+
+  ExistingPrivateSubnet2Id:
+    Type: String
+    Default: ''
+    AllowedPattern: '^(subnet-[a-z0-9]+)?$'
+    ConstraintDescription: Must be a valid subnet ID (subnet-xxx) or empty to create a new subnet.
+    Description: 'Existing private subnet for gateway instances (AZ 2). Leave empty to create new.'
+
+  PrivateSubnetCidr:
+    Type: String
+    Default: '10.0.10.0/24'
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    ConstraintDescription: Must be a valid CIDR block (e.g., 10.0.10.0/24)
+    Description: CIDR block for the first private subnet (gateway instances)
+
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: '10.0.11.0/24'
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    ConstraintDescription: Must be a valid CIDR block (e.g., 10.0.11.0/24)
+    Description: CIDR block for the second private subnet (gateway instances)
+
+  GatewayAmiId:
+    Type: AWS::EC2::Image::Id
+    Default: 'ami-0010b83013995a493'
+    Description: AMI ID for the Netskope AI Gateway appliance
+
+  InstanceType:
+    Type: String
+    Default: m5.4xlarge
+    AllowedValues:
+      - m5.4xlarge
+      - m6i.4xlarge
+      - c5.4xlarge
+    Description: EC2 instance type for the gateway (minimum 16 vCPU, 64 GiB RAM)
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: 'justin-us-west-1'
+    Description: SSH key pair for gateway instance access
+
+  SshSourceCidr:
+    Type: String
+    Default: '31.111.10.225/32'
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    ConstraintDescription: Must be a valid CIDR block (e.g., 31.111.10.225/32)
+    Description: Your public IP in CIDR notation for SSH access to the gateway
+
+  DlpHostUrl:
+    Type: String
+    Default: ''
+    Description: 'DLP on-demand host URL (e.g., https://dlpod.internal). Leave empty to skip DLP configuration.'
+
+  Project:
+    Type: String
+    Default: netskope-ai-gateway
+    Description: Project name, used as a tag value.
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: Lowercase alphanumeric and hyphens only.
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Deployment environment
+
+Conditions:
+  CreateNewVpc: !Equals [!Ref ExistingVpcId, '']
+  CreateNewPublicSubnet: !Equals [!Ref ExistingPublicSubnetId, '']
+  CreateNewPublicSubnet2: !Equals [!Ref ExistingPublicSubnet2Id, '']
+  CreateNewPrivateSubnet: !Equals [!Ref ExistingPrivateSubnetId, '']
+  CreateNewPrivateSubnet2: !Equals [!Ref ExistingPrivateSubnet2Id, '']
+
+Resources:
+
+  # ============================================================
+  # VPC and Networking (only created when no existing VPC/subnet)
+  # ============================================================
+
+  Vpc:
+    Type: AWS::EC2::VPC
+    Condition: CreateNewVpc
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-vpc'
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Condition: CreateNewVpc
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-igw'
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Condition: CreateNewVpc
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref Vpc
+
+  # ============================================================
+  # Public Subnet (Gateway Instance)
+  # ============================================================
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Condition: CreateNewPublicSubnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnetCidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-subnet'
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: CreateNewVpc
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-rt'
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    Condition: CreateNewVpc
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateNewVpc
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Condition: CreateNewPublicSubnet2
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-subnet-2'
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  PublicSubnetRouteTableAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateNewVpc
+    Properties:
+      SubnetId: !If [CreateNewPublicSubnet2, !Ref PublicSubnet2, !Ref ExistingPublicSubnet2Id]
+      RouteTableId: !Ref PublicRouteTable
+
+  # ============================================================
+  # NAT Gateway (for private subnet internet access)
+  # ============================================================
+
+  NatGatewayEip:
+    Type: AWS::EC2::EIP
+    Condition: CreateNewVpc
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-nat-eip'
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Condition: CreateNewVpc
+    Properties:
+      AllocationId: !GetAtt NatGatewayEip.AllocationId
+      SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-nat'
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ============================================================
+  # Private Subnets (Gateway Instances)
+  # ============================================================
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Condition: CreateNewPrivateSubnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnetCidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-subnet'
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Condition: CreateNewPrivateSubnet2
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-subnet-2'
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: CreateNewVpc
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-rt'
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Condition: CreateNewVpc
+    DependsOn: NatGateway
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateNewVpc
+    Properties:
+      SubnetId: !If [CreateNewPrivateSubnet, !Ref PrivateSubnet, !Ref ExistingPrivateSubnetId]
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetRouteTableAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateNewVpc
+    Properties:
+      SubnetId: !If [CreateNewPrivateSubnet2, !Ref PrivateSubnet2, !Ref ExistingPrivateSubnet2Id]
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ============================================================
+  # VPC Endpoints (only when creating a new VPC)
+  # ============================================================
+
+  VpcEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: CreateNewVpc
+    Properties:
+      GroupDescription: VPC interface endpoints - HTTPS from VPC
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref VpcCidr
+          Description: HTTPS from VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-vpce-sg'
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateNewVpc
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PublicRouteTable
+        - !Ref PrivateRouteTable
+
+  SsmEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateNewVpc
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssm'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !If [CreateNewPrivateSubnet, !Ref PrivateSubnet, !Ref ExistingPrivateSubnetId]
+        - !If [CreateNewPrivateSubnet2, !Ref PrivateSubnet2, !Ref ExistingPrivateSubnet2Id]
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+
+  SsmMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateNewVpc
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssmmessages'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !If [CreateNewPrivateSubnet, !Ref PrivateSubnet, !Ref ExistingPrivateSubnetId]
+        - !If [CreateNewPrivateSubnet2, !Ref PrivateSubnet2, !Ref ExistingPrivateSubnet2Id]
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+
+  Ec2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateNewVpc
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ec2messages'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !If [CreateNewPrivateSubnet, !Ref PrivateSubnet, !Ref ExistingPrivateSubnetId]
+        - !If [CreateNewPrivateSubnet2, !Ref PrivateSubnet2, !Ref ExistingPrivateSubnet2Id]
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+
+  SecretsManagerEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateNewVpc
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.secretsmanager'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !If [CreateNewPrivateSubnet, !Ref PrivateSubnet, !Ref ExistingPrivateSubnetId]
+        - !If [CreateNewPrivateSubnet2, !Ref PrivateSubnet2, !Ref ExistingPrivateSubnet2Id]
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+
+  # ============================================================
+  # Security Groups
+  # ============================================================
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB - HTTPS from internet
+      VpcId: !If [CreateNewVpc, !Ref Vpc, !Ref ExistingVpcId]
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: '0.0.0.0/0'
+          Description: HTTPS from internet
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+          Description: All outbound
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-alb-sg'
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  GatewaySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Netskope AI Gateway instance - HTTPS from ALB and VPC, SSH from authorized source
+      VpcId: !If [CreateNewVpc, !Ref Vpc, !Ref ExistingVpcId]
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: HTTPS from ALB
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref VpcCidr
+          Description: HTTPS from VPC consumers
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SshSourceCidr
+          Description: SSH from authorized source IP
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+          Description: All outbound traffic for appliance internal services and API connectivity
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-gateway-sg'
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ============================================================
+  # IAM Role and Instance Profile
+  # ============================================================
+
+  GatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-gateway-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: ReadEnrollmentToken
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: GetEnrollmentToken
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/aig/${AWS::StackName}/*/enrollment-token'
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  GatewayInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${AWS::StackName}-gateway-profile'
+      Roles:
+        - !Ref GatewayRole
+
+  # ============================================================
+  # Secrets Manager — Netskope API Credentials
+  # ============================================================
+
+  NetskopeSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}-netskope-credentials'
+      Description: Netskope tenant URL and API token for AI Gateway activation
+      SecretString: !Sub |
+        {"tenant_url": "${NetskopeTenantUrl}", "api_token": "${NetskopeApiToken}"}
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ============================================================
+  # SSM Automation Document — Gateway Setup
+  # ============================================================
+
+  GatewaySetupDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: !Sub '${AWS::StackName}-setup'
+      DocumentType: Automation
+      DocumentFormat: YAML
+      Content:
+        schemaVersion: '0.3'
+        description: 'Netskope AI Gateway — enrollment and DLP configuration'
+        parameters:
+          InstanceId:
+            type: String
+            description: EC2 instance ID
+          StackName:
+            type: String
+            description: CloudFormation stack name
+          DlpHostUrl:
+            type: String
+            description: DLP host URL (empty to skip)
+            default: ''
+          LifecycleHookName:
+            type: String
+            description: ASG lifecycle hook name (empty to skip lifecycle completion)
+            default: ''
+          AutoScalingGroupName:
+            type: String
+            description: ASG name for lifecycle completion
+            default: ''
+          LifecycleActionToken:
+            type: String
+            description: Lifecycle action token
+            default: ''
+        mainSteps:
+          - name: RunSetupScript
+            action: aws:runCommand
+            timeoutSeconds: 3600
+            inputs:
+              DocumentName: AWS-RunShellScript
+              InstanceIds:
+                - '{{ InstanceId }}'
+              CloudWatchOutputConfig:
+                CloudWatchOutputEnabled: true
+              Parameters:
+                executionTimeout:
+                  - '3600'
+                commands:
+                  - |
+                    #!/bin/bash
+                    set -euo pipefail
+
+                    LOG=/var/log/aig-automation.log
+                    exec > >(sudo tee -a "$LOG") 2>&1
+
+                    on_error() {
+                      local rc=$?
+                      echo ""
+                      echo "=================================================="
+                      echo " SCRIPT FAILED (exit $rc) — last 100 lines of log:"
+                      echo "=================================================="
+                      sudo tail -100 "$LOG"
+                      exit $rc
+                    }
+                    trap on_error ERR
+
+                    # ---------- Inputs ----------
+                    APPLIANCE_NAME='{{ StackName }}-gw'
+                    STACK_NAME='{{ StackName }}'
+                    INSTANCE_ID='{{ InstanceId }}'
+                    DLP_HOST='{{ DlpHostUrl }}'
+                    DLP_JWT=''
+                    DLP_CID=''
+                    DLP_SECRET=''
+                    DLP_SCOPE=''
+                    DLP_CA=''
+                    DLP_FETCH_ADDR=''
+
+                    VAM="http://localhost:56765"
+                    DMS="http://aig-dp-mgmt-service.aig-dp.svc.cluster.local:8080"
+
+                    WORKDIR=$(mktemp -d)
+                    trap "rm -rf $WORKDIR" EXIT
+
+                    for pkg in jq openssl; do
+                      command -v $pkg >/dev/null || {
+                        (sudo apt-get install -y $pkg 2>/dev/null || sudo yum install -y $pkg 2>/dev/null) || {
+                          echo "ERROR: $pkg required"; exit 1
+                        }
+                      }
+                    done
+
+                    # Get instance identity from IMDS
+                    IMDS_TOKEN=$(curl -sf -X PUT "http://169.254.169.254/latest/api/token" \
+                      -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+                    REGION=$(curl -sf -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" \
+                      http://169.254.169.254/latest/meta-data/placement/region)
+                    PUBLIC_IP=$(curl -sf -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" \
+                      http://169.254.169.254/latest/meta-data/public-ipv4 || echo "<none>")
+
+                    echo "============================================"
+                    echo " AIG Unified Automation"
+                    echo " Instance:  $INSTANCE_ID"
+                    echo " Public IP: $PUBLIC_IP"
+                    echo " Started:   $(date -u +%FT%TZ)"
+                    echo "============================================"
+
+                    echo ""
+                    echo "### Wait for VAM ###"
+                    for i in $(seq 1 90); do
+                      curl -sf "$VAM/internal/machine-spec" >/dev/null 2>&1 && {
+                        echo "VAM ready"; break
+                      }
+                      sleep 10
+                    done
+                    curl -sf "$VAM/internal/machine-spec" >/dev/null || {
+                      echo "ERROR: VAM did not come up"; exit 1
+                    }
+
+                    # =========================================================
+                    # PART 1 — Enrollment
+                    # =========================================================
+                    echo ""
+                    echo "============================================"
+                    echo " PART 1 — Enrollment"
+                    echo "============================================"
+
+                    DMS_STATE=$(curl -s "$DMS/enrollment" 2>/dev/null || echo '{}')
+                    CURRENT_STATUS=$(echo "$DMS_STATE" | jq -r '.status // "none"')
+                    CURRENT_GATEWAY=$(echo "$DMS_STATE" | jq -r '.gateway_id // "none"')
+                    echo "DMS status:     $CURRENT_STATUS"
+                    echo "DMS gateway_id: $CURRENT_GATEWAY"
+
+                    if [ "$CURRENT_STATUS" = "completed" ]; then
+                      echo "==> Skipping enrollment: already enrolled"
+                    else
+                      if [ -z "$STACK_NAME" ] || [ -z "$INSTANCE_ID" ]; then
+                        echo "ERROR: Not enrolled but STACK_NAME or INSTANCE_ID is missing."
+                        exit 1
+                      fi
+
+                      echo ""
+                      echo "### 1.1 Pre-enrollment install ###"
+                      PRE_STATE=$(curl -sSf "$VAM/internal/pre-enrollment" | jq -r '.status')
+                      echo "State: $PRE_STATE"
+                      if [ "$PRE_STATE" = "not_installed" ]; then
+                        curl -sSf -X POST "$VAM/internal/pre-enrollment" >/dev/null
+                        DEADLINE=$(( $(date +%s) + 900 ))
+                        while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+                          RESP=$(curl -sSf "$VAM/internal/pre-enrollment")
+                          STATUS=$(echo "$RESP" | jq -r '.status')
+                          PROGRESS=$(echo "$RESP" | jq -r '.progress // 0')
+                          echo "   status=$STATUS progress=$PROGRESS%"
+                          [ "$STATUS" = "installed" ] && break
+                          case "$STATUS" in
+                            install_failed|check_env_failed) echo "ERROR: install failed"; exit 1 ;;
+                          esac
+                          sleep 15
+                        done
+                        [ "$STATUS" = "installed" ] || { echo "ERROR: timed out"; exit 1; }
+                      fi
+
+                      echo ""
+                      echo "### 1.2 Retrieve enrollment token from Parameter Store ###"
+                      TOKEN_PARAM="/aig/$STACK_NAME/$INSTANCE_ID/enrollment-token"
+                      echo "Reading: $TOKEN_PARAM"
+
+                      # Refresh IMDS token (may have expired during pre-enrollment)
+                      IMDS_TOKEN=$(curl -sf -X PUT "http://169.254.169.254/latest/api/token" \
+                        -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+                      REGION=$(curl -sf -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" \
+                        http://169.254.169.254/latest/meta-data/placement/region)
+
+                      # Get IAM credentials from instance metadata (IMDSv2)
+                      CREDS_JSON=$(curl -sf -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" \
+                        http://169.254.169.254/latest/meta-data/iam/security-credentials/ | head -1)
+                      CREDS=$(curl -sf -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" \
+                        "http://169.254.169.254/latest/meta-data/iam/security-credentials/$CREDS_JSON")
+
+                      AWS_ACCESS_KEY_ID=$(echo "$CREDS" | jq -r '.AccessKeyId')
+                      AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r '.SecretAccessKey')
+                      AWS_SESSION_TOKEN=$(echo "$CREDS" | jq -r '.Token')
+                      export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+
+                      if command -v aws >/dev/null 2>&1; then
+                        ENROLL_TOKEN=$(aws ssm get-parameter \
+                          --name "$TOKEN_PARAM" \
+                          --with-decryption \
+                          --region "$REGION" \
+                          --query "Parameter.Value" \
+                          --output text)
+                      elif command -v python3 >/dev/null 2>&1; then
+                        ENROLL_TOKEN=$(python3 -c "
+                    import boto3, sys
+                    client = boto3.client('ssm', region_name='$REGION')
+                    resp = client.get_parameter(Name='$TOKEN_PARAM', WithDecryption=True)
+                    print(resp['Parameter']['Value'])
+                    ")
+                      else
+                        echo "ERROR: Neither aws CLI nor python3+boto3 available"
+                        exit 1
+                      fi
+
+                      if [ -z "$ENROLL_TOKEN" ]; then
+                        echo "ERROR: Failed to read enrollment token"
+                        exit 1
+                      fi
+                      echo "Enrollment token retrieved"
+
+                      echo ""
+                      echo "### 1.3 Submit enrollment token ###"
+                      jq -n --arg t "$ENROLL_TOKEN" '{token:$t}' > "$WORKDIR/token.json"
+                      SUBMIT_RESP=$(curl -sS -w "\nHTTP_STATUS:%{http_code}" \
+                        -X PUT "$DMS/enrollment" \
+                        -H "Content-Type: application/json" \
+                        -d "@$WORKDIR/token.json")
+                      SUBMIT_BODY=$(echo "$SUBMIT_RESP" | sed '$d')
+                      SUBMIT_CODE=$(echo "$SUBMIT_RESP" | tail -n1 | cut -d: -f2)
+                      if [ "$SUBMIT_CODE" = "409" ]; then
+                        echo "ERROR: HTTP 409 — stale enrollment state"
+                        exit 1
+                      fi
+                      if [ "$SUBMIT_CODE" != "200" ] && [ "$SUBMIT_CODE" != "201" ]; then
+                        echo "ERROR: submission failed (HTTP $SUBMIT_CODE)"; echo "$SUBMIT_BODY"; exit 1
+                      fi
+
+                      echo ""
+                      echo "### 1.4 Poll completion ###"
+                      DEADLINE=$(( $(date +%s) + 600 )); FINAL=""
+                      while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+                        ST=$(curl -sSf "$DMS/enrollment" | jq -r '.status')
+                        echo "   status=$ST"; FINAL="$ST"
+                        [ "$ST" = "completed" ] && break
+                        [ "$ST" = "failed" ] && { echo "ERROR: failed"; exit 1; }
+                        sleep 10
+                      done
+                      [ "$FINAL" = "completed" ] || { echo "ERROR: timed out"; exit 1; }
+
+                      echo ""
+                      echo "### 1.5 Restart services ###"
+                      curl -sSf -X POST "$VAM/internal/mgmt/restart-service" \
+                        -H "Content-Type: application/json" \
+                        -d '{"service_names":["aig-dp-mgmt-service","aig-traffic-intercept-service","aig-ext-authz-service","aig-rls-service"]}' \
+                        | jq . || true
+                      sleep 30
+                      echo "==> Enrollment complete"
+                    fi
+
+                    # =========================================================
+                    # PART 2 — DLP Service Config
+                    # =========================================================
+                    if [ -n "$DLP_HOST" ]; then
+                      echo ""
+                      echo "============================================"
+                      echo " PART 2 — DLP Configuration"
+                      echo "============================================"
+
+                      echo ""
+                      echo "### 2.1 Check current DLP config ###"
+                      DLP_CUR=$(curl -sf "$DMS/aiapi/dlp/config" 2>/dev/null || echo "{}")
+                      echo "$DLP_CUR" | jq . 2>/dev/null || echo "$DLP_CUR"
+
+                      HOST_PRECONFIGURED=$(echo "$DLP_CUR" | jq -r '.host_config_configured // false')
+                      CERT_PRECONFIGURED=$(echo "$DLP_CUR" | jq -r '.certificate_configured // false')
+                      echo "host_config previously configured: $HOST_PRECONFIGURED"
+                      echo "certificate previously configured: $CERT_PRECONFIGURED"
+
+                      DLP_CA_TRIMMED=$(echo "$DLP_CA" | tr -d '[:space:]')
+                      if [ -z "$DLP_CA_TRIMMED" ]; then DLP_CA=""; fi
+
+                      if [ -z "$DLP_CA" ]; then
+                        FETCH_TARGET="$DLP_FETCH_ADDR"
+                        if [ -z "$FETCH_TARGET" ]; then
+                          FETCH_TARGET=$(echo "$DLP_HOST" | sed -E 's|^https?://||; s|/.*$||')
+                        fi
+                        echo "$FETCH_TARGET" | grep -q ':' || FETCH_TARGET="$FETCH_TARGET:443"
+
+                        echo ""
+                        echo "### 2.2a Auto-fetch DLPoD cert from $FETCH_TARGET ###"
+                        FETCHED_CERT=$(echo | openssl s_client -connect "$FETCH_TARGET" -servername "${FETCH_TARGET%:*}" 2>/dev/null \
+                          | openssl x509 -outform PEM 2>/dev/null || echo "")
+
+                        if [ -n "$FETCHED_CERT" ] && echo "$FETCHED_CERT" | grep -q "BEGIN CERTIFICATE"; then
+                          echo "Fetched certificate:"
+                          echo "$FETCHED_CERT" | openssl x509 -noout -subject -issuer -dates 2>/dev/null | sed 's/^/   /'
+                          DLP_CA="$FETCHED_CERT"
+                        else
+                          echo "WARNING: could not fetch cert from $FETCH_TARGET"
+                          if [ "$CERT_PRECONFIGURED" != "true" ]; then
+                            echo "ERROR: No cert available and none previously configured"
+                            exit 1
+                          fi
+                        fi
+                      fi
+
+                      if [ -n "$DLP_CA" ]; then
+                        echo ""
+                        echo "### 2.2 Upload DLP trusted CA cert ###"
+                        echo "$DLP_CA" > "$WORKDIR/dlp-ca.pem"
+                        DLP_CA_PAYLOAD=$(jq -n --rawfile cert "$WORKDIR/dlp-ca.pem" '{certificate: $cert}')
+                        echo "PUT $DMS/aiapi/dlp/cert"
+                        curl -sS -X PUT "$DMS/aiapi/dlp/cert" \
+                          -H "Content-Type: application/json" \
+                          -d "$DLP_CA_PAYLOAD" | jq . 2>/dev/null || true
+                        echo "==> DLP CA cert uploaded"
+                      fi
+
+                      echo ""
+                      echo "### 2.3 Set DLP host config ###"
+                      DLP_HOST_PAYLOAD=$(jq -n \
+                        --arg host "$DLP_HOST" \
+                        --arg jwt  "$DLP_JWT" \
+                        --arg cid  "$DLP_CID" \
+                        --arg sec  "$DLP_SECRET" \
+                        --arg sc   "$DLP_SCOPE" \
+                        '{host_url:$host} +
+                         (if $jwt != "" then {jwt_url:$jwt} else {} end) +
+                         (if $cid != "" then {client_id:$cid} else {} end) +
+                         (if $sec != "" then {client_secret:$sec} else {} end) +
+                         (if $sc  != "" then {scope:$sc} else {} end)')
+                      echo "PUT $DMS/aiapi/dlp/hostconfig"
+                      echo "host_url: $DLP_HOST"
+                      curl -sS -X PUT "$DMS/aiapi/dlp/hostconfig" \
+                        -H "Content-Type: application/json" \
+                        -d "$DLP_HOST_PAYLOAD" | jq . 2>/dev/null || true
+                      echo "==> DLP host config set"
+
+                      echo ""
+                      echo "### 2.4 Restart services ###"
+                      curl -sSf -X POST "$VAM/internal/mgmt/restart-service" \
+                        -H "Content-Type: application/json" \
+                        -d '{"service_names":["aig-dp-mgmt-service","aig-traffic-intercept-service","aig-ext-authz-service","aig-rls-service"]}' \
+                        | jq . || true
+                      echo "==> Services restarted after DLP config"
+                    fi
+
+                    # =========================================================
+                    # PART 3 — Verify final state
+                    # =========================================================
+                    set +e
+                    echo ""
+                    echo "============================================"
+                    echo " PART 3 — Verify"
+                    echo "============================================"
+
+                    echo ""
+                    echo "Enrollment status:"
+                    VERIFY_E=$(curl -s --max-time 30 "$DMS/enrollment" 2>/dev/null || echo "")
+                    if [ -n "$VERIFY_E" ]; then
+                      echo "$VERIFY_E" | jq . 2>/dev/null || echo "$VERIFY_E"
+                    else
+                      echo "(verify call did not respond — services may be restarting)"
+                    fi
+
+                    if [ -n "$DLP_HOST" ]; then
+                      echo ""
+                      echo "DLP config:"
+                      VERIFY_D=$(curl -s --max-time 30 "$DMS/aiapi/dlp/config" 2>/dev/null || echo "")
+                      if [ -n "$VERIFY_D" ]; then
+                        echo "$VERIFY_D" | jq . 2>/dev/null || echo "$VERIFY_D"
+                      else
+                        echo "(verify call did not respond)"
+                      fi
+                    fi
+                    set -e
+
+                    echo ""
+                    echo "============================================"
+                    echo " DONE"
+                    echo " Completed: $(date -u +%FT%TZ)"
+                    echo "============================================"
+          - name: CheckLifecycleHook
+            action: aws:branch
+            inputs:
+              Choices:
+                - NextStep: CompleteLifecycleAction
+                  Not:
+                    Variable: '{{ LifecycleHookName }}'
+                    StringEquals: ''
+              Default: Done
+          - name: CompleteLifecycleAction
+            action: aws:executeAwsApi
+            isEnd: true
+            inputs:
+              Service: autoscaling
+              Api: CompleteLifecycleAction
+              LifecycleHookName: '{{ LifecycleHookName }}'
+              AutoScalingGroupName: '{{ AutoScalingGroupName }}'
+              LifecycleActionToken: '{{ LifecycleActionToken }}'
+              LifecycleActionResult: CONTINUE
+          - name: Done
+            action: aws:sleep
+            isEnd: true
+            inputs:
+              Duration: PT0S
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ============================================================
+  # Activation Lambda (Custom Resource)
+  # ============================================================
+
+  ActivationLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-activation-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ActivationLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: GetNetskopeSecret
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref NetskopeSecret
+              - Sid: WriteEnrollmentToken
+                Effect: Allow
+                Action:
+                  - ssm:PutParameter
+                  - ssm:DeleteParameter
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/aig/${AWS::StackName}/*/enrollment-token'
+              - Sid: RunSetupAutomation
+                Effect: Allow
+                Action:
+                  - ssm:StartAutomationExecution
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:automation-definition/${AWS::StackName}-setup:*'
+              - Sid: AutomationRunCommand
+                Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}::document/AWS-RunShellScript'
+                  - !Sub 'arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/*'
+              - Sid: AutomationTrackCommand
+                Effect: Allow
+                Action:
+                  - ssm:GetCommandInvocation
+                  - ssm:ListCommands
+                  - ssm:ListCommandInvocations
+                Resource: '*'
+              - Sid: CheckInstanceSSM
+                Effect: Allow
+                Action:
+                  - ssm:DescribeInstanceInformation
+                Resource: '*'
+              - Sid: DescribeInstances
+                Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                Resource: '*'
+              - Sid: CompleteLifecycleAction
+                Effect: Allow
+                Action:
+                  - autoscaling:CompleteLifecycleAction
+                Resource: !Sub 'arn:aws:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/${AWS::StackName}-*'
+              - Sid: StoreApplianceMapping
+                Effect: Allow
+                Action:
+                  - ssm:PutParameter
+                  - ssm:GetParameter
+                  - ssm:DeleteParameter
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/aig/${AWS::StackName}/*/appliance-id'
+              - Sid: WriteLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt ActivationLambdaLogGroup.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  ActivationLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-activation'
+      RetentionInDays: 30
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  ActivationLambdaFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: ActivationLambdaLogGroup
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-activation'
+      Description: Creates/deletes Netskope AI Gateway appliance and enrollment token
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 300
+      MemorySize: 128
+      ReservedConcurrentExecutions: 1
+      Role: !GetAtt ActivationLambdaRole.Arn
+      Environment:
+        Variables:
+          STACK_NAME: !Ref 'AWS::StackName'
+          SECRET_ARN: !Ref NetskopeSecret
+          DLP_HOST_URL: !Ref DlpHostUrl
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import logging
+          import urllib.request
+          import urllib.error
+          import boto3
+          import cfnresponse
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          ssm = boto3.client('ssm')
+          ec2_client = boto3.client('ec2')
+          asg_client = boto3.client('autoscaling')
+
+          def get_instance_public_ip(instance_id):
+              resp = ec2_client.describe_instances(InstanceIds=[instance_id])
+              reservations = resp.get('Reservations', [])
+              if reservations:
+                  instances = reservations[0].get('Instances', [])
+                  if instances:
+                      return instances[0].get('PublicIpAddress') or instances[0].get('PrivateIpAddress', 'unknown')
+              return 'unknown'
+
+          def complete_lifecycle_action(detail, result='CONTINUE'):
+              asg_client.complete_lifecycle_action(
+                  LifecycleHookName=detail['LifecycleHookName'],
+                  AutoScalingGroupName=detail['AutoScalingGroupName'],
+                  LifecycleActionToken=detail['LifecycleActionToken'],
+                  LifecycleActionResult=result,
+              )
+              logger.info('Completed lifecycle action: %s', result)
+
+          def get_secret(secret_arn):
+              client = boto3.client('secretsmanager')
+              resp = client.get_secret_value(SecretId=secret_arn)
+              return json.loads(resp['SecretString'])
+
+          def api_request(tenant_url, path, token, method='GET', body=None):
+              url = f"{tenant_url.rstrip('/')}{path}"
+              data = json.dumps(body).encode() if body else None
+              req = urllib.request.Request(url, data=data, method=method)
+              req.add_header('Netskope-Api-Token', token)
+              req.add_header('Content-Type', 'application/json')
+              try:
+                  with urllib.request.urlopen(req) as resp:
+                      return json.loads(resp.read().decode())
+              except urllib.error.HTTPError as e:
+                  error_body = e.read().decode() if e.fp else ''
+                  logger.error('API %s %s -> %s: %s', method, path, e.code, error_body)
+                  raise
+
+          def write_token_to_ssm(stack_name, instance_id, token):
+              param_name = f'/aig/{stack_name}/{instance_id}/enrollment-token'
+              ssm.put_parameter(
+                  Name=param_name,
+                  Value=token,
+                  Type='SecureString',
+                  Overwrite=True,
+              )
+              logger.info('Wrote enrollment token to %s', param_name)
+
+          def wait_for_ssm_agent(instance_id, timeout=240):
+              """Poll until the instance is registered with SSM."""
+              import time
+              deadline = time.time() + timeout
+              while time.time() < deadline:
+                  resp = ssm.describe_instance_information(
+                      Filters=[{'Key': 'InstanceIds', 'Values': [instance_id]}]
+                  )
+                  instances = resp.get('InstanceInformationList', [])
+                  if instances and instances[0].get('PingStatus') == 'Online':
+                      logger.info('SSM agent online for %s', instance_id)
+                      return True
+                  logger.info('Waiting for SSM agent on %s...', instance_id)
+                  time.sleep(15)
+              return False
+
+          def send_setup_command(instance_id, stack_name, dlp_host,
+                                  lifecycle_hook_name='', asg_name='', lifecycle_token=''):
+              """Wait for SSM agent, then invoke the SSM Automation document."""
+              if not wait_for_ssm_agent(instance_id):
+                  raise RuntimeError(f'SSM agent not online for {instance_id} after waiting')
+
+              doc_name = f'{stack_name}-setup'
+              # SSM parameters don't accept empty strings — omit optional params if empty
+              params = {
+                  'InstanceId': [instance_id],
+                  'StackName': [stack_name],
+              }
+              if dlp_host:
+                  params['DlpHostUrl'] = [dlp_host]
+              if lifecycle_hook_name:
+                  params['LifecycleHookName'] = [lifecycle_hook_name]
+              if asg_name:
+                  params['AutoScalingGroupName'] = [asg_name]
+              if lifecycle_token:
+                  params['LifecycleActionToken'] = [lifecycle_token]
+              resp = ssm.start_automation_execution(
+                  DocumentName=doc_name,
+                  Parameters=params,
+              )
+              exec_id = resp['AutomationExecutionId']
+              logger.info('Started automation %s (doc=%s) for %s', exec_id, doc_name, instance_id)
+              return exec_id
+
+          def delete_token_from_ssm(stack_name, instance_id):
+              param_name = f'/aig/{stack_name}/{instance_id}/enrollment-token'
+              try:
+                  ssm.delete_parameter(Name=param_name)
+                  logger.info('Deleted parameter %s', param_name)
+              except ssm.exceptions.ParameterNotFound:
+                  pass
+
+          def register_appliance(tenant_url, api_token, appliance_name, public_ip):
+              """Register appliance with Netskope tenant and return (appliance_id, enrollment_token)."""
+              appliance = api_request(
+                  tenant_url,
+                  '/api/v2/aig/appliances',
+                  api_token,
+                  method='POST',
+                  body={
+                      'name': appliance_name,
+                      'host': public_ip,
+                      'ports': {
+                          'https': {'port': 443, 'enable': True},
+                          'http': {'port': 80, 'enable': False},
+                      },
+                  },
+              )
+              appliance_id = str(appliance['id'])
+              enrollment_token = appliance.get('enrollment_token', '')
+              logger.info('Created appliance %s', appliance_id)
+
+              if not enrollment_token:
+                  try:
+                      token_resp = api_request(
+                          tenant_url,
+                          f'/api/v2/aig/appliances/{appliance_id}/enrollmenttokens',
+                          api_token,
+                          method='POST',
+                      )
+                      enrollment_token = token_resp.get('token') or token_resp.get('enrollment_token', '')
+                  except Exception:
+                      logger.exception('Token creation failed — deleting orphan appliance %s', appliance_id)
+                      try:
+                          api_request(tenant_url, f'/api/v2/aig/appliances/{appliance_id}', api_token, method='DELETE')
+                      except Exception:
+                          logger.exception('Cleanup delete also failed')
+                      raise
+
+              if not enrollment_token:
+                  raise ValueError('Enrollment token not found in API response')
+
+              return appliance_id, enrollment_token
+
+          def deregister_appliance(tenant_url, api_token, appliance_id):
+              """Deregister appliance from Netskope tenant."""
+              try:
+                  api_request(tenant_url, f'/api/v2/aig/appliances/{appliance_id}', api_token, method='DELETE')
+                  logger.info('Deleted appliance %s', appliance_id)
+              except Exception:
+                  logger.exception('Delete failed for appliance %s — continuing', appliance_id)
+
+          def handle_lifecycle_event(event, context):
+              """Handle ASG lifecycle hook events (launch/terminate)."""
+              # SNS format has fields at top level; EventBridge wraps in 'detail'
+              detail = event.get('detail', event)
+              instance_id = detail['EC2InstanceId']
+              transition = detail['LifecycleTransition']
+
+              stack_name = os.environ['STACK_NAME']
+              secret_arn = os.environ['SECRET_ARN']
+              dlp_host = os.environ.get('DLP_HOST_URL', '')
+
+              try:
+                  if transition == 'autoscaling:EC2_INSTANCE_LAUNCHING':
+                      secret = get_secret(secret_arn)
+                      public_ip = get_instance_public_ip(instance_id)
+                      appliance_name = f'{stack_name}-gw-{instance_id}'
+
+                      appliance_id, enrollment_token = register_appliance(
+                          secret['tenant_url'], secret['api_token'],
+                          appliance_name, public_ip,
+                      )
+
+                      write_token_to_ssm(stack_name, instance_id, enrollment_token)
+
+                      # Store appliance ID for cleanup on termination
+                      ssm.put_parameter(
+                          Name=f'/aig/{stack_name}/{instance_id}/appliance-id',
+                          Value=appliance_id, Type='String', Overwrite=True,
+                      )
+
+                      # Pass lifecycle details to SSM automation — it will complete
+                      # the lifecycle action after enrollment succeeds
+                      try:
+                          send_setup_command(
+                              instance_id, stack_name, dlp_host,
+                              lifecycle_hook_name=detail.get('LifecycleHookName', ''),
+                              asg_name=detail.get('AutoScalingGroupName', ''),
+                              lifecycle_token=detail.get('LifecycleActionToken', ''),
+                          )
+                      except Exception:
+                          logger.exception('SSM setup failed — abandoning lifecycle')
+                          try:
+                              complete_lifecycle_action(detail, 'ABANDON')
+                          except Exception:
+                              logger.exception('Failed to abandon lifecycle action')
+
+                  elif transition == 'autoscaling:EC2_INSTANCE_TERMINATING':
+                      # Get stored appliance ID
+                      appliance_id = None
+                      try:
+                          resp = ssm.get_parameter(Name=f'/aig/{stack_name}/{instance_id}/appliance-id')
+                          appliance_id = resp['Parameter']['Value']
+                      except Exception:
+                          logger.warning('No appliance ID found for %s', instance_id)
+
+                      if appliance_id:
+                          secret = get_secret(secret_arn)
+                          deregister_appliance(secret['tenant_url'], secret['api_token'], appliance_id)
+
+                      # Clean up SSM parameters
+                      delete_token_from_ssm(stack_name, instance_id)
+                      try:
+                          ssm.delete_parameter(Name=f'/aig/{stack_name}/{instance_id}/appliance-id')
+                      except Exception:
+                          pass
+
+                      complete_lifecycle_action(detail, 'CONTINUE')
+
+              except Exception:
+                  logger.exception('Lifecycle handler failed for %s', instance_id)
+                  try:
+                      complete_lifecycle_action(detail, 'ABANDON')
+                  except Exception:
+                      logger.exception('Failed to complete lifecycle action')
+
+          def handle_cfn_event(event, context):
+              """Handle CloudFormation Custom Resource events (used by single-instance template)."""
+              request_type = event['RequestType']
+              props = event['ResourceProperties']
+
+              try:
+                  if request_type == 'Create':
+                      secret = get_secret(props['SecretArn'])
+                      instance_id = props['InstanceId']
+                      stack_name = props['StackName']
+                      public_ip = props.get('PublicIp', 'unknown')
+                      appliance_name = props['ApplianceName']
+
+                      appliance_id, enrollment_token = register_appliance(
+                          secret['tenant_url'], secret['api_token'],
+                          appliance_name, public_ip,
+                      )
+
+                      write_token_to_ssm(stack_name, instance_id, enrollment_token)
+
+                      dlp_host = props.get('DlpHostUrl', '')
+                      try:
+                          send_setup_command(instance_id, stack_name, dlp_host)
+                      except Exception:
+                          logger.exception('SSM setup failed — instance may need manual setup')
+
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                          'ApplianceId': appliance_id,
+                          'EnrollmentToken': enrollment_token,
+                      }, physicalResourceId=appliance_id)
+
+                  elif request_type == 'Delete':
+                      appliance_id = event.get('PhysicalResourceId', '')
+                      instance_id = props.get('InstanceId', '')
+                      stack_name = props.get('StackName', '')
+
+                      if instance_id and stack_name:
+                          delete_token_from_ssm(stack_name, instance_id)
+
+                      if appliance_id and not appliance_id.startswith('arn:'):
+                          secret = get_secret(props['SecretArn'])
+                          deregister_appliance(secret['tenant_url'], secret['api_token'], appliance_id)
+
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, physicalResourceId=appliance_id)
+
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {},
+                                       physicalResourceId=event.get('PhysicalResourceId', ''))
+
+              except Exception:
+                  logger.exception('Handler failed')
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {},
+                                   physicalResourceId=event.get('PhysicalResourceId', ''))
+
+          def handler(event, context):
+              logger.info('Event: %s', json.dumps(event, default=str))
+
+              # SNS wrapper from lifecycle hook
+              if 'Records' in event and event['Records'][0].get('EventSource') == 'aws:sns':
+                  message = json.loads(event['Records'][0]['Sns']['Message'])
+                  logger.info('SNS lifecycle message: %s', json.dumps(message, default=str))
+                  # Skip test notifications sent when SNS subscription is created
+                  if message.get('Event') == 'autoscaling:TEST_NOTIFICATION':
+                      logger.info('Skipping test notification')
+                      return
+                  return handle_lifecycle_event(message, context)
+              # EventBridge lifecycle event (direct)
+              elif 'detail' in event and 'LifecycleTransition' in event.get('detail', {}):
+                  return handle_lifecycle_event(event.get('detail', event), context)
+              # CFN Custom Resource event
+              elif 'RequestType' in event:
+                  return handle_cfn_event(event, context)
+              else:
+                  logger.error('Unknown event type')
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ============================================================
+  # Application Load Balancer
+  # ============================================================
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${AWS::StackName}-alb'
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - !If [CreateNewPublicSubnet, !Ref PublicSubnet, !Ref ExistingPublicSubnetId]
+        - !If [CreateNewPublicSubnet2, !Ref PublicSubnet2, !Ref ExistingPublicSubnet2Id]
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-alb'
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${AWS::StackName}-tg'
+      Port: 443
+      Protocol: HTTPS
+      VpcId: !If [CreateNewVpc, !Ref Vpc, !Ref ExistingVpcId]
+      TargetType: instance
+      HealthCheckProtocol: HTTPS
+      HealthCheckPath: /
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      HealthCheckIntervalSeconds: 30
+      Matcher:
+        HttpCode: '200-499'
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref AcmCertificateArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+
+  # ============================================================
+  # Launch Template + Auto Scaling Group
+  # ============================================================
+
+  GatewayLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${AWS::StackName}-lt'
+      LaunchTemplateData:
+        ImageId: !Ref GatewayAmiId
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyPairName
+        SecurityGroupIds:
+          - !Ref GatewaySecurityGroup
+        IamInstanceProfile:
+          Name: !Ref GatewayInstanceProfile
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1
+            Ebs:
+              Encrypted: true
+              VolumeSize: 400
+              VolumeType: gp3
+        MetadataOptions:
+          HttpTokens: required
+          HttpEndpoint: enabled
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${AWS::StackName}-gateway'
+              - Key: Project
+                Value: !Ref Project
+              - Key: Environment
+                Value: !Ref Environment
+              - Key: ManagedBy
+                Value: CloudFormation
+
+  GatewayAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub '${AWS::StackName}-asg'
+      LaunchTemplate:
+        LaunchTemplateId: !Ref GatewayLaunchTemplate
+        Version: !GetAtt GatewayLaunchTemplate.LatestVersionNumber
+      MinSize: !Ref MinCapacity
+      MaxSize: !Ref MaxCapacity
+      DesiredCapacity: !Ref DesiredCapacity
+      VPCZoneIdentifier:
+        - !If [CreateNewPrivateSubnet, !Ref PrivateSubnet, !Ref ExistingPrivateSubnetId]
+        - !If [CreateNewPrivateSubnet2, !Ref PrivateSubnet2, !Ref ExistingPrivateSubnet2Id]
+      TargetGroupARNs:
+        - !Ref ALBTargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 900
+      LifecycleHookSpecificationList:
+        - LifecycleHookName: !Sub '${AWS::StackName}-launch-hook'
+          LifecycleTransition: 'autoscaling:EC2_INSTANCE_LAUNCHING'
+          HeartbeatTimeout: 900
+          DefaultResult: ABANDON
+          NotificationTargetARN: !Ref LifecycleSnsTopic
+          RoleARN: !GetAtt LifecycleSnsRole.Arn
+        - LifecycleHookName: !Sub '${AWS::StackName}-terminate-hook'
+          LifecycleTransition: 'autoscaling:EC2_INSTANCE_TERMINATING'
+          HeartbeatTimeout: 300
+          DefaultResult: CONTINUE
+          NotificationTargetARN: !Ref LifecycleSnsTopic
+          RoleARN: !GetAtt LifecycleSnsRole.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+          PropagateAtLaunch: false
+        - Key: Environment
+          Value: !Ref Environment
+          PropagateAtLaunch: false
+        - Key: ManagedBy
+          Value: CloudFormation
+          PropagateAtLaunch: false
+
+  # ============================================================
+  # Lifecycle Hooks
+  # ============================================================
+
+  # ============================================================
+  # Lifecycle Hook SNS Integration
+  # ============================================================
+
+  LifecycleSnsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-lifecycle'
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  LifecycleSnsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref LifecycleSnsTopic
+      Protocol: lambda
+      Endpoint: !GetAtt ActivationLambdaFunction.Arn
+
+  LambdaLifecyclePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ActivationLambdaFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref LifecycleSnsTopic
+
+  LifecycleSnsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-lifecycle-sns-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: autoscaling.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PublishToSns
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref LifecycleSnsTopic
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+
+Outputs:
+  VpcId:
+    Description: VPC ID
+    Value: !If [CreateNewVpc, !Ref Vpc, !Ref ExistingVpcId]
+    Export:
+      Name: !Sub '${AWS::StackName}-VpcId'
+
+  PublicSubnetId:
+    Description: Public subnet ID
+    Value: !If [CreateNewPublicSubnet, !Ref PublicSubnet, !Ref ExistingPublicSubnetId]
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnetId'
+
+  PrivateSubnetId:
+    Description: Private subnet ID (AZ 1)
+    Value: !If [CreateNewPrivateSubnet, !Ref PrivateSubnet, !Ref ExistingPrivateSubnetId]
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnetId'
+
+  GatewaySecurityGroupId:
+    Description: Gateway security group ID
+    Value: !Ref GatewaySecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-GatewaySecurityGroupId'
+
+  ALBDnsName:
+    Description: ALB DNS name
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub '${AWS::StackName}-ALBDnsName'
+
+  ALBHostedZoneId:
+    Description: ALB hosted zone ID (for Route 53 alias records)
+    Value: !GetAtt ApplicationLoadBalancer.CanonicalHostedZoneID
+
+  AutoScalingGroupName:
+    Description: Auto Scaling group name
+    Value: !Ref GatewayAutoScalingGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-AutoScalingGroupName'

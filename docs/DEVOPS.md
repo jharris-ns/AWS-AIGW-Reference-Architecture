@@ -211,6 +211,43 @@ The Lambda runs in its own execution environment, completely separate from the g
 
 ---
 
+## Accessing Gateway Instances
+
+Gateway instances run in private subnets with no direct inbound SSH access from the internet. Use AWS Systems Manager Session Manager to connect — no bastion host, SSH key, or open security group port required.
+
+### Start an interactive session
+
+```bash
+aws ssm start-session --target <instance-id>
+```
+
+This opens a shell on the instance through the SSM agent, which is already installed in the AI Gateway AMI and authorized by the instance IAM role.
+
+### Run a one-off command
+
+```bash
+aws ssm send-command \
+  --instance-ids <instance-id> \
+  --document-name AWS-RunShellScript \
+  --parameters 'commands=["systemctl status aig-*"]' \
+  --output text \
+  --query "Command.CommandId"
+
+# Retrieve the output
+aws ssm get-command-invocation \
+  --command-id <command-id> \
+  --instance-id <instance-id> \
+  --query "StandardOutputContent" \
+  --output text
+```
+
+### Requirements
+
+- The VPC must have the SSM interface endpoints (`ssm`, `ssmmessages`, `ec2messages`) — the template creates these automatically for new VPCs. For existing VPCs, see [VPC Requirements](#vpc-requirements).
+- The `KeyPairName` parameter is optional and only needed if you require traditional SSH access through a bastion host or VPN.
+
+---
+
 ## Monitoring and Troubleshooting
 
 ### Log Locations
@@ -335,8 +372,7 @@ The template automatically creates all required VPC endpoints with a dedicated s
 | `PublicSubnet2Cidr` | No | 10.0.2.0/24 | CIDR for new subnet 2 |
 | `GatewayAmiId` | No | ami-0010b83013995a493 | Netskope AI Gateway AMI |
 | `InstanceType` | No | m5.4xlarge | Instance type (16 vCPU, 64 GiB minimum) |
-| `KeyPairName` | No | justin-us-west-1 | SSH key pair |
-| `SshSourceCidr` | No | 31.111.10.225/32 | Allowed SSH source |
+| `KeyPairName` | No | - | SSH key pair (optional, for bastion/VPN access) |
 | `MinCapacity` | No | 1 | ASG minimum instances |
 | `MaxCapacity` | No | 3 | ASG maximum instances |
 | `DesiredCapacity` | No | 1 | ASG desired instances |

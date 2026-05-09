@@ -1605,7 +1605,7 @@ Resources:
       LifecycleHookSpecificationList:
         - LifecycleHookName: !Sub '${AWS::StackName}-launch-hook'
           LifecycleTransition: 'autoscaling:EC2_INSTANCE_LAUNCHING'
-          HeartbeatTimeout: 3600
+          HeartbeatTimeout: 1200
           DefaultResult: ABANDON
           NotificationTargetARN: !Ref LifecycleSnsTopic
           RoleARN: !GetAtt LifecycleSnsRole.Arn

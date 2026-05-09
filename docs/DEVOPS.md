@@ -29,9 +29,12 @@ Each gateway instance is a Netskope AI Gateway appliance that must be individual
 | Launch Template | `GatewayLaunchTemplate` | Instance configuration (AMI, type, SG, IAM) |
 | Lifecycle Hooks | `LaunchLifecycleHook`, `TerminateLifecycleHook` | Hold instances in wait state during enrollment/cleanup |
 | SNS Topic | `LifecycleSnsTopic` | Delivers lifecycle events to the Lambda |
-| Lambda | `ActivationLambdaFunction` | Registers/deregisters appliances, triggers SSM automation |
-| SSM Document | `GatewaySetupDocument` | On-instance enrollment and DLP configuration script |
-| Secrets Manager | `NetskopeSecret` | Stores tenant URL and API token |
+| Activation Lambda | `ActivationLambdaFunction` | Registers/deregisters appliances, starts Step Functions |
+| Enrollment Lambda | `EnrollmentLambdaFunction` | SSH/TUI enrollment actions (VPC-attached, paramiko + pyte) |
+| Step Functions | `EnrollmentStateMachine` | Orchestrates enrollment: SSH wait → TUI enrollment → lifecycle completion |
+| Lambda Layer | `ParamikoLayer` | paramiko + pyte for SSH/TUI automation |
+| SSH Key Pair | `SSHKeyPair` (Custom Resource) | Generates key pair for Lambda→gateway SSH access |
+| Secrets Manager | `NetskopeSecret`, `SSHPrivateKeySecret` | Tenant credentials and SSH private key |
 
 ---
 
@@ -51,33 +54,22 @@ Lifecycle hook: Pending:Wait
 SNS delivers EC2_INSTANCE_LAUNCHING event
         |
         v
-Lambda invoked
+Activation Lambda invoked
   1. Reads Netskope API credentials from Secrets Manager
   2. Calls POST /api/v2/aig/appliances (Netskope tenant API)
-     - Registers appliance with instance's public IP
-     - Receives enrollment token in response
-  3. Writes enrollment token to SSM Parameter Store
-     /aig/{stack-name}/{instance-id}/enrollment-token (SecureString)
-  4. Stores appliance ID mapping
+     - Registers appliance with instance's private IP
+     - Receives enrollment token in response (held in memory only)
+  3. Stores appliance ID mapping in SSM Parameter Store
      /aig/{stack-name}/{instance-id}/appliance-id (String)
-  5. Waits for SSM agent to come online (polls every 15s, 240s timeout)
-  6. Starts SSM Automation execution (fire-and-forget)
+  4. Starts Step Functions execution with instance IP, token, lifecycle details
         |
         v
-SSM Automation runs on the instance
-  Step 1: RunSetupScript
-    - Waits for VAM service (internal appliance manager)
-    - Triggers pre-enrollment install (~5-10 min on fresh instance)
-    - Reads enrollment token from Parameter Store
-    - Submits token to local DMS service
-    - Polls enrollment until status=completed
-    - Restarts appliance services
-    - Configures DLP (cert fetch + host config) if DlpHostUrl provided
-    - Restarts services again after DLP config
-  Step 2: CheckLifecycleHook
-    - Branches: if lifecycle hook params present, continue; else skip
-  Step 3: CompleteLifecycleAction
-    - Calls autoscaling:CompleteLifecycleAction with CONTINUE
+Step Functions state machine runs
+  WaitForSSH         → SSH connect test (retry every 15s until ready)
+  StartEnrollment    → SSH to nsadmin, navigate aig-cli TUI, press Enter on enrollment
+  PollPreEnrollment  → Poll every 30s until "Enter enrollment token:" appears (~10-15 min)
+  SubmitToken        → Enter token via TUI, wait for "Enrollment completed"
+  CompleteLifecycle   → Calls CompleteLifecycleAction with CONTINUE
         |
         v
 Instance moves to InService
@@ -89,9 +81,9 @@ ALB health check passes (HTTPS 443)
 Instance receives traffic
 ```
 
-**Total time from launch to InService:** ~10-15 minutes (dominated by pre-enrollment install and enrollment polling).
+**Total time from launch to InService:** ~15-20 minutes (dominated by pre-enrollment install and enrollment polling).
 
-**Failure handling:** If the SSM automation fails, the lifecycle hook's `HeartbeatTimeout` (900s) expires and the `DefaultResult: ABANDON` triggers, causing the ASG to terminate the instance and try again.
+**Failure handling:** If the Step Functions execution fails, the lifecycle hook's `HeartbeatTimeout` (1200s / 20 min) expires and the `DefaultResult: ABANDON` triggers, causing the ASG to terminate the instance and try again. Step Functions provides detailed per-step error logs for diagnosis.
 
 ### Terminate Flow
 
@@ -107,12 +99,12 @@ Lifecycle hook: Terminating:Wait
 SNS delivers EC2_INSTANCE_TERMINATING event
         |
         v
-Lambda invoked
+Activation Lambda invoked
   1. Reads appliance ID from SSM Parameter Store
      /aig/{stack-name}/{instance-id}/appliance-id
   2. Calls DELETE /api/v2/aig/appliances/{id} (Netskope tenant API)
      - Deregisters appliance from tenant
-  3. Deletes SSM parameters (enrollment-token and appliance-id)
+  3. Deletes SSM parameter (appliance-id)
   4. Calls CompleteLifecycleAction with CONTINUE
         |
         v
@@ -188,63 +180,54 @@ The instance would fetch the API token from Secrets Manager or Parameter Store, 
 
 The Lambda runs in its own execution environment, completely separate from the gateway instances:
 
-- **API credentials never touch the instance.** The Lambda reads from Secrets Manager and calls the Netskope API. Only the enrollment token (a one-time-use value specific to that instance) is written to Parameter Store for the instance to consume.
-- **Instance IAM role is minimal.** The gateway role only has `ssm:GetParameter` scoped to its own enrollment token path (`/aig/{stack}/*/enrollment-token`). It cannot read the API credentials.
-- **Lambda logs are isolated.** CloudWatch logs for the Lambda are in a separate log group with controlled retention. The API token is never logged (the Lambda only logs appliance IDs and status messages).
-- **Clean termination.** The same Lambda handles both launch and terminate events, deregistering the appliance from the tenant when an instance is removed.
+- **API credentials never touch the instance.** The Activation Lambda reads from Secrets Manager and calls the Netskope API. The enrollment token exists only in Lambda memory and is passed directly to the instance over SSH — it is never persisted to any AWS storage service.
+- **Instance IAM role is minimal.** The gateway role only has CloudWatch Logs permissions. It cannot read API credentials, SSH keys, or any secrets.
+- **Lambda logs are isolated.** CloudWatch logs for both Lambdas are in separate log groups with controlled retention. The API token is never logged.
+- **Clean termination.** The Activation Lambda handles both launch and terminate events, deregistering the appliance from the tenant when an instance is removed.
 
 ### Secret Storage Layout
 
 | Secret | Location | Who reads it |
 |--------|----------|-------------|
-| Netskope tenant URL + API token | Secrets Manager: `{stack}-netskope-credentials` | Lambda only |
-| Enrollment token (per instance) | SSM Parameter Store: `/aig/{stack}/{instance-id}/enrollment-token` (SecureString) | Gateway instance |
-| Appliance ID mapping (per instance) | SSM Parameter Store: `/aig/{stack}/{instance-id}/appliance-id` (String) | Lambda (on terminate) |
+| Netskope tenant URL + API token | Secrets Manager: `{stack}-netskope-credentials` | Activation Lambda only |
+| SSH private key | Secrets Manager: `{stack}-ssh-private-key` | Enrollment Lambda (for SSH to gateway instances) |
+| Appliance ID mapping (per instance) | SSM Parameter Store: `/aig/{stack}/{instance-id}/appliance-id` (String) | Activation Lambda (on terminate) |
 
 ### IAM Boundaries
 
 | Role | Can access | Cannot access |
 |------|-----------|---------------|
-| `{stack}-gateway-role` (EC2) | Own enrollment token in Parameter Store | Netskope API credentials in Secrets Manager |
-| `{stack}-activation-lambda-role` (Lambda) | Secrets Manager, Parameter Store, SSM automation, ASG lifecycle | Nothing beyond what's explicitly granted |
+| `{stack}-gateway-role` (EC2) | CloudWatch Logs | Everything else (no Secrets Manager, no Parameter Store, no Netskope API) |
+| `{stack}-activation-lambda-role` (Lambda) | Secrets Manager (Netskope creds), Parameter Store (appliance ID), ASG lifecycle, Step Functions | SSH key secret, VPC resources |
+| `{stack}-enrollment-lambda-role` (Lambda, VPC) | Secrets Manager (SSH key + Netskope creds), ASG lifecycle, VPC networking | Nothing beyond what's explicitly granted |
+| `{stack}-sfn-role` (Step Functions) | Invoke Enrollment Lambda | Nothing else |
 | `{stack}-lifecycle-sns-role` (ASG) | Publish to the lifecycle SNS topic | Nothing else |
 
 ---
 
 ## Accessing Gateway Instances
 
-Gateway instances run in private subnets with no direct inbound SSH access from the internet. Use AWS Systems Manager Session Manager to connect — no bastion host, SSH key, or open security group port required.
+Gateway instances run in private subnets with no direct inbound SSH access from the internet. For interactive access, use SSH via a bastion host or VPN. The `nsadmin` user drops into the aig-cli TUI menu on login.
 
-### Start an interactive session
-
-```bash
-aws ssm start-session --target <instance-id>
-```
-
-This opens a shell on the instance through the SSM agent, which is already installed in the AI Gateway AMI and authorized by the instance IAM role.
-
-### Run a one-off command
+### SSH via bastion host
 
 ```bash
-aws ssm send-command \
-  --instance-ids <instance-id> \
-  --document-name AWS-RunShellScript \
-  --parameters 'commands=["systemctl status aig-*"]' \
-  --output text \
-  --query "Command.CommandId"
-
-# Retrieve the output
-aws ssm get-command-invocation \
-  --command-id <command-id> \
-  --instance-id <instance-id> \
-  --query "StandardOutputContent" \
-  --output text
+# From a bastion in the same VPC
+ssh -i /path/to/key.pem nsadmin@<instance-private-ip>
 ```
 
-### Requirements
+The EC2 key pair is generated at stack creation and stored in Secrets Manager (`{stack}-ssh-private-key`). Retrieve it for manual SSH access:
 
-- The VPC must have the SSM interface endpoints (`ssm`, `ssmmessages`, `ec2messages`) — the template creates these automatically for new VPCs. For existing VPCs, see [VPC Requirements](#vpc-requirements).
-- The `KeyPairName` parameter is optional and only needed if you require traditional SSH access through a bastion host or VPN.
+```bash
+aws secretsmanager get-secret-value \
+  --secret-id <stack>-ssh-private-key \
+  --query SecretString --output text > /tmp/key.pem
+chmod 400 /tmp/key.pem
+```
+
+### Note on SSM Session Manager
+
+The SSM agent is not installed on gateway instances. Interactive access requires SSH via a bastion host, VPN, or Direct Connect.
 
 ---
 
@@ -254,35 +237,38 @@ aws ssm get-command-invocation \
 
 | Component | Log location | What to look for |
 |-----------|-------------|-----------------|
-| Lambda | CloudWatch: `/aws/lambda/{stack}-activation` | Appliance registration, token writes, SSM agent wait, automation start |
-| SSM Automation | SSM console > Automation executions | Step status (RunSetupScript, CheckLifecycleHook, CompleteLifecycleAction) |
-| Instance setup script | CloudWatch: `/aws/ssm/AWS-RunShellScript` and on-instance at `/var/log/aig-automation.log` | Pre-enrollment progress, enrollment polling, DLP config |
+| Activation Lambda | CloudWatch: `/aws/lambda/{stack}-activation` | Appliance registration, Step Functions start, deregistration |
+| Enrollment Lambda | CloudWatch: `/aws/lambda/{stack}-enrollment` | SSH connection, TUI screen captures, token submission |
+| Step Functions | Step Functions console > Executions | Per-step status, timing, input/output, errors |
 | ASG activity | ASG console > Activity tab | Launch/terminate events, lifecycle hook timeouts |
 
 ### Common Failure Scenarios
 
 **Instance stuck in Pending:Wait**
 
-The lifecycle hook has a 900s heartbeat timeout. If the instance is still in `Pending:Wait` after several minutes:
+The lifecycle hook has a 1200s (20 min) heartbeat timeout. If the instance is still in `Pending:Wait` after 15+ minutes:
 
-1. Check the Lambda logs — did it receive the SNS event? Did it start the automation?
-2. Check the SSM automation execution — is `RunSetupScript` still running or did it fail?
-3. Check if the SSM agent came online — the Lambda polls for 240s. If the agent never registers, the VPC may be missing SSM endpoints.
+1. Check the Activation Lambda logs — did it receive the SNS event? Did it register the appliance and start Step Functions?
+2. Check the Step Functions execution — which state is it in? Did any state fail?
+3. Check SSH connectivity — can the Enrollment Lambda reach the instance on port 22? Check security groups and VPC routing.
+4. Check TUI state — SSH to the instance manually and run `aig-cli` to see enrollment progress.
 
 ```bash
-# Check automation status
-aws ssm get-automation-execution \
-  --automation-execution-id <exec-id> \
-  --query "AutomationExecution.{Status:AutomationExecutionStatus,Steps:StepExecutions[*].{Name:StepName,Status:StepStatus}}"
+# Check Step Functions execution status
+aws stepfunctions list-executions \
+  --state-machine-arn arn:aws:states:<region>:<account>:stateMachine:<stack>-enrollment \
+  --query "executions[*].{Name:name,Status:status,Start:startDate}" \
+  --output table
 ```
 
 **Lifecycle hook times out (ABANDON)**
 
 If `DefaultResult: ABANDON` fires, the instance is terminated and the ASG launches a replacement. Check:
 
-- Lambda CloudWatch logs for errors during appliance registration
-- SSM automation output for script failures (enrollment timeout, DLP cert issues)
-- Instance may not have network connectivity (check VPC endpoints, security groups, route tables)
+- Activation Lambda logs for errors during appliance registration or Step Functions start
+- Step Functions execution history for the specific state that failed
+- Enrollment Lambda logs for SSH connection errors or TUI parsing issues
+- Instance may not have network connectivity (check NAT gateway, security groups, route tables)
 
 **Lambda receives TEST_NOTIFICATION errors**
 
@@ -308,28 +294,19 @@ aws autoscaling describe-scaling-activities \
   --query "Activities[*].{Status:StatusCode,Description:Description}" \
   --output table
 
-# Check SSM automation executions for a stack
-aws ssm describe-automation-executions \
-  --filters Key=DocumentNamePrefix,Values=<stack>-setup \
-  --query "AutomationExecutionMetadataList[*].{Id:AutomationExecutionId,Status:AutomationExecutionStatus,Start:ExecutionStartTime}" \
-  --output table
+# Check Step Functions execution history
+aws stepfunctions get-execution-history \
+  --execution-arn <execution-arn> \
+  --query "events[?type=='TaskStateEntered'].stateEnteredEventDetails.name" \
+  --output text
 
-# Check DLP config on a running instance via SSM
-aws ssm send-command \
-  --instance-ids <instance-id> \
-  --document-name AWS-RunShellScript \
-  --parameters 'commands=["curl -s http://aig-dp-mgmt-service.aig-dp.svc.cluster.local:8080/aiapi/dlp/config | jq ."]'
+# Check enrollment Lambda logs (latest invocation)
+aws logs tail /aws/lambda/<stack>-enrollment --since 30m
 
-# Check enrollment status on a running instance
-aws ssm send-command \
-  --instance-ids <instance-id> \
-  --document-name AWS-RunShellScript \
-  --parameters 'commands=["curl -s http://aig-dp-mgmt-service.aig-dp.svc.cluster.local:8080/enrollment | jq ."]'
-
-# Manually re-run the setup automation on an instance
-aws ssm start-automation-execution \
-  --document-name <stack>-setup \
-  --parameters "InstanceId=<instance-id>,StackName=<stack>,DlpHostUrl=<url>"
+# Manually start a Step Functions enrollment for an instance
+aws stepfunctions start-execution \
+  --state-machine-arn arn:aws:states:<region>:<account>:stateMachine:<stack>-enrollment \
+  --input '{"instance_ip":"<ip>","appliance_id":"<id>","enrollment_token":"<token>"}'
 ```
 
 ---
@@ -338,21 +315,20 @@ aws ssm start-automation-execution \
 
 ### When using an existing VPC
 
-The template does not create VPC endpoints when deploying into an existing VPC. The following endpoints must exist in the VPC for the stack to function:
+The template creates a Secrets Manager VPC endpoint in all deployments (both new and existing VPCs). For existing VPCs, the following must also be available:
 
 | Endpoint | Type | Required by |
 |----------|------|------------|
-| `com.amazonaws.<region>.ssm` | Interface | SSM agent on gateway instances |
-| `com.amazonaws.<region>.ssmmessages` | Interface | SSM Session Manager / RunCommand |
-| `com.amazonaws.<region>.ec2messages` | Interface | SSM agent communication |
-| `com.amazonaws.<region>.secretsmanager` | Interface | Lambda (if running in VPC) |
-| `com.amazonaws.<region>.s3` | Gateway | General AWS SDK operations |
+| `com.amazonaws.<region>.secretsmanager` | Interface | Enrollment Lambda (reads SSH key from Secrets Manager) |
+| `com.amazonaws.<region>.s3` | Gateway | Lambda Layer downloads |
 
-The endpoint security groups must allow HTTPS (443) inbound from the VPC CIDR or from the gateway security group.
+The endpoint security groups must allow HTTPS (443) inbound from the Lambda security group or VPC CIDR. The template creates a dedicated security group (`{stack}-vpce-sg`) with rules for both.
+
+**Important:** The Enrollment Lambda must be in private subnets with a NAT gateway for outbound internet access (needed to call `CompleteLifecycleAction` and for general AWS API access).
 
 ### When creating a new VPC
 
-The template automatically creates all required VPC endpoints with a dedicated security group (`{stack}-vpce-sg`) allowing HTTPS from the VPC CIDR.
+The template automatically creates the VPC with public subnets (ALB, NAT gateway), private subnets (gateways, Lambda), internet gateway, NAT gateway, S3 gateway endpoint, and Secrets Manager interface endpoint.
 
 ---
 
@@ -372,7 +348,9 @@ The template automatically creates all required VPC endpoints with a dedicated s
 | `PublicSubnet2Cidr` | No | 10.0.2.0/24 | CIDR for new subnet 2 |
 | `GatewayAmiId` | No | ami-0010b83013995a493 | Netskope AI Gateway AMI |
 | `InstanceType` | No | m5.4xlarge | Instance type (16 vCPU, 64 GiB minimum) |
-| `KeyPairName` | No | - | SSH key pair (optional, for bastion/VPN access) |
+| `LambdaCodeBucket` | Yes | - | S3 bucket containing Lambda package and Layer |
+| `LambdaCodeKey` | No | lambda-step-function.zip | S3 key for enrollment Lambda package |
+| `LambdaLayerKey` | No | layers/pexpect-layer.zip | S3 key for paramiko/pyte Lambda Layer |
 | `MinCapacity` | No | 1 | ASG minimum instances |
 | `MaxCapacity` | No | 3 | ASG maximum instances |
 | `DesiredCapacity` | No | 1 | ASG desired instances |

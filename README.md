@@ -17,7 +17,7 @@ Before deploying, ensure the following are in place.
 The AI Gateway is deployed from a shared AMI provided by Netskope. This AMI must be available in your target AWS account and region.
 
 - If the AMI is not in your account, contact your Netskope representative to have it shared, or copy it from the source account using `aws ec2 copy-image`.
-- The AMI includes the SSM agent, the AI Gateway appliance services (VAM, DMS, traffic intercept, ext-authz, RLS), and all required dependencies.
+- The AMI includes the AI Gateway appliance services (VAM, DMS, traffic intercept, ext-authz, RLS), SSH support for Lambda automation, and all required dependencies.
 - Pass the AMI ID as the `GatewayAmiId` parameter when deploying.
 
 ### 2. Netskope Tenant Credentials
@@ -53,9 +53,15 @@ An AWS Certificate Manager (ACM) certificate is required for the ALB HTTPS liste
 
 Note the certificate ARN — it is a required stack parameter. See [CERTIFICATE_MANAGEMENT.md](docs/CERTIFICATE_MANAGEMENT.md) for step-by-step instructions on creating and importing certificates (macOS, Linux, and Windows).
 
-### 4. EC2 Key Pair
+### 4. Lambda Deployment Artifacts
 
-An EC2 key pair in the target region for SSH access to gateway instances (for troubleshooting). Create one via the EC2 console or CLI if you don't have one.
+The enrollment Lambda and its Layer must be built and uploaded to an S3 bucket in the deployment region. A script is provided that handles bucket creation, builds, and uploads:
+
+```bash
+scripts/deploy-artifacts.sh us-west-1
+```
+
+See [DEPLOYMENT.md](docs/DEPLOYMENT.md) for manual steps and update procedures.
 
 ### 5. DLPoD Appliance (Optional)
 
@@ -70,10 +76,10 @@ The template creates resources across the following AWS services:
 | **EC2** | Launch Template, Security Groups, VPC (optional), Subnets (optional), VPC Endpoints (optional) |
 | **Auto Scaling** | Auto Scaling Group, Lifecycle Hooks |
 | **Elastic Load Balancing** | Application Load Balancer, Target Group, HTTPS Listener |
-| **Lambda** | Function (Python 3.12), Permission |
-| **IAM** | 3 Roles (gateway, Lambda, lifecycle SNS), Instance Profile |
-| **Secrets Manager** | 1 Secret (Netskope credentials) |
-| **Systems Manager** | SSM Document (Automation), Parameter Store entries |
+| **Lambda** | 2 Functions (activation + enrollment), Layer, Permission |
+| **Step Functions** | State Machine (enrollment orchestration) |
+| **IAM** | 5 Roles (gateway, activation Lambda, enrollment Lambda, Step Functions, lifecycle SNS), Instance Profile |
+| **Secrets Manager** | 2 Secrets (Netskope credentials, SSH private key) |
 | **SNS** | Topic, Subscription |
 | **CloudWatch Logs** | Log Group (Lambda) |
 
@@ -154,15 +160,14 @@ You can create a dedicated IAM role with this policy and assume it before deploy
       "Resource": "*"
     },
     {
-      "Sid": "SSM",
+      "Sid": "StepFunctions",
       "Effect": "Allow",
       "Action": [
-        "ssm:CreateDocument",
-        "ssm:DeleteDocument",
-        "ssm:UpdateDocument",
-        "ssm:DescribeDocument",
-        "ssm:GetDocument",
-        "ssm:UpdateDocumentDefaultVersion"
+        "states:CreateStateMachine",
+        "states:DeleteStateMachine",
+        "states:UpdateStateMachine",
+        "states:DescribeStateMachine",
+        "states:TagResource"
       ],
       "Resource": "*"
     },
@@ -232,8 +237,9 @@ aws s3 mb "s3://${BUCKET}" --region "${REGION}"
 ### Upload templates
 
 ```bash
-aws s3 cp templates/gateway.yaml     "s3://${BUCKET}/templates/gateway.yaml"
 aws s3 cp templates/gateway-asg.yaml "s3://${BUCKET}/templates/gateway-asg.yaml"
+aws s3 cp scripts/lambda-step-function.zip "s3://${BUCKET}/lambda-step-function.zip"
+aws s3 cp scripts/pexpect-layer.zip "s3://${BUCKET}/layers/pexpect-layer.zip"
 ```
 
 ### Bucket layout
@@ -241,8 +247,10 @@ aws s3 cp templates/gateway-asg.yaml "s3://${BUCKET}/templates/gateway-asg.yaml"
 ```
 s3://<bucket>/
   templates/
-    gateway.yaml          # Single-instance deployment (44 KB)
-    gateway-asg.yaml      # Auto Scaling deployment (64 KB)
+    gateway-asg.yaml          # Auto Scaling deployment (~59 KB)
+  lambda-step-function.zip    # Enrollment Lambda package
+  layers/
+    pexpect-layer.zip         # paramiko/pyte Lambda Layer
 ```
 
 ### Template URL format
@@ -273,6 +281,7 @@ aws cloudformation create-stack \
     ParameterKey=NetskopeApiToken,ParameterValue=<token> \
     ParameterKey=AcmCertificateArn,ParameterValue=arn:aws:acm:<region>:<account>:certificate/<id> \
     ParameterKey=DlpHostUrl,ParameterValue=https://dlpod.internal \
+    ParameterKey=LambdaCodeBucket,ParameterValue=${BUCKET} \
   --capabilities CAPABILITY_NAMED_IAM
 ```
 
@@ -334,8 +343,9 @@ The template uses a split-subnet architecture: **public subnets** for the ALB an
 |-----------|----------|-------------|
 | `GatewayAmiId` | Yes | Netskope AI Gateway AMI ID. Obtain from your Netskope representative. |
 | `InstanceType` | No | Instance type. Minimum 16 vCPU, 64 GiB RAM. Allowed: m5.4xlarge, m6i.4xlarge, c5.4xlarge. |
-| `KeyPairName` | Yes | EC2 key pair name for SSH access. |
-| `SshSourceCidr` | Yes | CIDR allowed for SSH access (e.g., `203.0.113.10/32`). |
+| `LambdaCodeBucket` | Yes | S3 bucket containing Lambda package and Layer. |
+| `LambdaCodeKey` | No | S3 key for enrollment Lambda (default: `lambda-step-function.zip`). |
+| `LambdaLayerKey` | No | S3 key for paramiko/pyte Layer (default: `layers/pexpect-layer.zip`). |
 
 > **Note:** Advanced AI guardrails (beyond basic policy enforcement) require a CUDA-capable NVIDIA GPU. If advanced guardrails are needed, use GPU instance types (e.g., g4dn.4xlarge, g5.4xlarge) and update the `AllowedValues` constraint in the template.
 
@@ -364,7 +374,7 @@ The template uses a split-subnet architecture: **public subnets** for the ALB an
 
 ## VPC Requirements (Existing VPC)
 
-When deploying into an existing VPC, you are responsible for ensuring the VPC meets the following requirements. The template does not validate these at deployment time — failures will manifest as SSM agent connectivity issues or Lambda timeouts.
+When deploying into an existing VPC, you are responsible for ensuring the VPC meets the following requirements. The template does not validate these at deployment time — failures will manifest as VPC endpoint connectivity issues or Lambda timeouts.
 
 ### Subnets
 
@@ -381,35 +391,24 @@ The template requires **four subnets** — two public and two private, each pair
 - Two subnets in different AZs ensure multi-AZ instance placement.
 - VPC endpoints (see below) can reduce dependency on the NAT gateway for AWS service calls.
 
-### VPC Endpoints (Preferred) or Public Internet Access
+### VPC Endpoints and NAT Gateway
 
-The SSM agent on the gateway instances must be able to reach the AWS Systems Manager API endpoints. There are two ways to provide this connectivity:
+The Enrollment Lambda runs in the VPC private subnets and needs access to:
 
-**Option 1: VPC Endpoints (preferred)**
+| Service | Access method | Purpose |
+|---------|--------------|---------|
+| Secrets Manager | VPC endpoint (created by template) | Read SSH private key |
+| ASG / Step Functions APIs | NAT gateway | Complete lifecycle action, AWS API calls |
+| Gateway instances (SSH) | Direct VPC connectivity | TUI enrollment over port 22 |
 
-VPC endpoints keep SSM traffic on the AWS backbone network, avoid NAT gateway costs, and reduce the attack surface. The following endpoints are required:
+The private subnets **must have a NAT gateway** for outbound internet access. The gateway instances also require NAT for Netskope policy updates and LLM provider connectivity.
 
-| Endpoint Service | Type | Purpose |
-|-------------------|------|---------|
-| `com.amazonaws.<region>.ssm` | Interface | SSM agent registration and parameter retrieval |
-| `com.amazonaws.<region>.ssmmessages` | Interface | SSM RunCommand and Session Manager communication |
-| `com.amazonaws.<region>.ec2messages` | Interface | SSM agent heartbeat and command delivery |
-| `com.amazonaws.<region>.s3` | Gateway | AWS SDK operations, CloudWatch log delivery |
-
-Each interface endpoint must have a security group that allows **HTTPS (TCP 443) inbound** from the VPC CIDR or from the gateway security group. Without this rule, the SSM agent cannot reach the endpoint ENIs and will not register with Systems Manager.
-
-**Option 2: Public internet access**
-
-If VPC endpoints are not available, the gateway instances must have public internet access (via an internet gateway and public IP, or via a NAT gateway in a private subnet). The SSM agent will connect to the regional SSM endpoints over the public internet.
-
-This approach is simpler to set up but means SSM traffic traverses the internet, and instances in private subnets require a NAT gateway (which has hourly and data-transfer costs).
-
-**Common symptom of missing connectivity:** instances launch, the Lambda waits for the SSM agent (logs show "Waiting for SSM agent on i-xxx..."), the 240-second timeout expires, and the lifecycle hook abandons the instance.
+The template creates a Secrets Manager VPC endpoint in all deployments. An S3 gateway endpoint is created when deploying a new VPC.
 
 ### DNS Resolution
 
 - The VPC must have **DNS support** and **DNS hostnames** enabled (`EnableDnsSupport: true`, `EnableDnsHostnames: true`).
-- Interface endpoints must have **Private DNS enabled** so that the SSM agent can resolve `ssm.<region>.amazonaws.com` to the endpoint's private IP.
+- The Secrets Manager VPC endpoint must have **Private DNS enabled** so the Lambda can resolve `secretsmanager.<region>.amazonaws.com` to the endpoint's private IP.
 
 ### DLPoD Network Connectivity
 
@@ -453,5 +452,6 @@ The DLPoD appliance must be deployed separately (it is not included in this temp
 - [Deploy AI Gateway on Netskope Portal](https://docs.netskope.com/en/deploy-ai-gateway-on-netskope-portal/)
 - [AI Gateway Sizing Guidelines](https://docs.netskope.com/en/ai-gateway-sizing-guidelines/)
 - [DLP On Demand Documentation](https://docs.netskope.com/en/data-loss-prevention-on-demand/)
+- [DEPLOYMENT.md](docs/DEPLOYMENT.md) — Building artifacts, uploading to S3, and deploying the stack
 - [CERTIFICATE_MANAGEMENT.md](docs/CERTIFICATE_MANAGEMENT.md) — Creating and importing ACM certificates
 - [DEVOPS.md](docs/DEVOPS.md) — Operational runbook covering instance lifecycle, scaling, secrets management, and troubleshooting

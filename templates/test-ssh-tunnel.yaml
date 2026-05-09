@@ -1,0 +1,527 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  SSH tunnel proof-of-concept. Tests the full proposed key management flow:
+  generates an SSH key pair at stack creation, stores private key in Secrets
+  Manager, imports public key into EC2, launches an Ubuntu instance with the
+  generated key pair, and deploys a Lambda that SSHs to the instance through
+  a tunnel to call localhost:8080 APIs. Also includes a TUI test Lambda that
+  uses pexpect to drive interactive SSH sessions.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC to deploy into
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Public subnet for the instance
+
+  LambdaCodeBucket:
+    Type: String
+    Description: S3 bucket containing Lambda deployment packages and layers
+
+  LambdaCodeKey:
+    Type: String
+    Default: lambda-ssh-tunnel.zip
+    Description: S3 key for the SSH tunnel Lambda deployment package
+
+  TuiLambdaCodeKey:
+    Type: String
+    Default: lambda-tui-test.zip
+    Description: S3 key for the TUI test Lambda deployment package
+
+  PexpectLayerKey:
+    Type: String
+    Default: layers/pexpect-layer.zip
+    Description: S3 key for the pexpect/pyte/ssh Lambda Layer
+
+  SshSourceCidr:
+    Type: String
+    Default: ''
+    Description: Optional - your public IP in CIDR notation for direct SSH access to the instance
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    Description: Instance type
+
+Conditions:
+  HasSshSourceCidr: !Not [!Equals [!Ref SshSourceCidr, '']]
+
+Resources:
+  # =========================================================
+  # SSH Key Pair Generation (proposed approach from doc)
+  # =========================================================
+
+  SSHPrivateKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}-ssh-private-key'
+      Description: SSH private key for Lambda-to-instance automation
+
+  SSHKeyGeneratorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-keygen-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: KeyGenPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:CreateKeyPair
+                  - ec2:DeleteKeyPair
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - secretsmanager:PutSecretValue
+                Resource: !Ref SSHPrivateKeySecret
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  SSHKeyGeneratorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-keygen'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt SSHKeyGeneratorRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          ec2 = boto3.client('ec2')
+          sm = boto3.client('secretsmanager')
+
+          def handler(event, context):
+              key_pair_name = event['ResourceProperties']['KeyPairName']
+              secret_arn = event['ResourceProperties']['SecretArn']
+              request_type = event['RequestType']
+
+              try:
+                  if request_type == 'Create':
+                      # EC2 creates the key pair and returns the private key
+                      # material in the response -- this is the only time the
+                      # private key is available
+                      resp = ec2.create_key_pair(
+                          KeyName=key_pair_name,
+                          KeyType='rsa',
+                          KeyFormat='pem',
+                      )
+                      private_pem = resp['KeyMaterial']
+                      logger.info('Created EC2 key pair: %s', key_pair_name)
+
+                      # Store the private key in Secrets Manager so the
+                      # activation Lambda can retrieve it at runtime
+                      sm.put_secret_value(
+                          SecretId=secret_arn,
+                          SecretString=private_pem,
+                      )
+                      logger.info('Stored private key in Secrets Manager')
+
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                          'KeyPairName': key_pair_name,
+                      }, physicalResourceId=key_pair_name)
+
+                  elif request_type == 'Delete':
+                      try:
+                          ec2.delete_key_pair(KeyName=key_pair_name)
+                          logger.info('Deleted EC2 key pair: %s', key_pair_name)
+                      except Exception:
+                          logger.exception('Failed to delete key pair — may already be gone')
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {},
+                                       physicalResourceId=key_pair_name)
+
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                          'KeyPairName': key_pair_name,
+                      }, physicalResourceId=key_pair_name)
+
+              except Exception:
+                  logger.exception('Key generation failed')
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {},
+                                   physicalResourceId=key_pair_name)
+
+  SSHKeyPair:
+    Type: Custom::SSHKeyPair
+    Properties:
+      ServiceToken: !GetAtt SSHKeyGeneratorFunction.Arn
+      KeyPairName: !Sub '${AWS::StackName}-key'
+      SecretArn: !Ref SSHPrivateKeySecret
+
+  # =========================================================
+  # Test Instance
+  # =========================================================
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SSH tunnel test instance
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+          Description: SSH from Lambda
+        - !If
+          - HasSshSourceCidr
+          - IpProtocol: tcp
+            FromPort: 22
+            ToPort: 22
+            CidrIp: !Ref SshSourceCidr
+            Description: SSH from operator
+          - !Ref AWS::NoValue
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+          Description: All outbound
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-instance-sg'
+
+  TestInstance:
+    Type: AWS::EC2::Instance
+    DependsOn: SSHKeyPair
+    Properties:
+      ImageId: !Sub '{{resolve:ssm:/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id}}'
+      InstanceType: !Ref InstanceType
+      KeyName: !Sub '${AWS::StackName}-key'
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          set -e
+
+          # Create automation user with standard shell
+          useradd -m -s /bin/bash lambda-automation
+          mkdir -p /home/lambda-automation/.ssh
+          chmod 700 /home/lambda-automation/.ssh
+
+          # Copy the EC2-injected public key to the automation user
+          cp /home/ubuntu/.ssh/authorized_keys /home/lambda-automation/.ssh/authorized_keys
+          chmod 600 /home/lambda-automation/.ssh/authorized_keys
+          chown -R lambda-automation:lambda-automation /home/lambda-automation/.ssh
+
+          # Install minimal API server
+          apt-get update -y
+          apt-get install -y python3
+
+          cat > /opt/api-server.py << 'APIEOF'
+          #!/usr/bin/env python3
+          import json
+          from http.server import HTTPServer, BaseHTTPRequestHandler
+
+          STATE = {
+              'enrollment': {'status': 'not_enrolled', 'gateway_id': None},
+              'pre_enrollment': {'status': 'not_installed', 'progress': 0},
+              'machine_spec': {'cpu': 4, 'memory_gb': 16, 'status': 'ready'},
+          }
+
+          class Handler(BaseHTTPRequestHandler):
+              def _send(self, code, body):
+                  self.send_response(code)
+                  self.send_header('Content-Type', 'application/json')
+                  self.end_headers()
+                  self.wfile.write(json.dumps(body).encode())
+
+              def do_GET(self):
+                  if self.path == '/internal/machine-spec':
+                      self._send(200, STATE['machine_spec'])
+                  elif self.path == '/internal/pre-enrollment':
+                      self._send(200, STATE['pre_enrollment'])
+                  elif self.path == '/enrollment':
+                      self._send(200, STATE['enrollment'])
+                  elif self.path == '/health':
+                      self._send(200, {'status': 'ok'})
+                  else:
+                      self._send(404, {'error': 'not found'})
+
+              def do_POST(self):
+                  if self.path == '/internal/pre-enrollment':
+                      STATE['pre_enrollment'] = {'status': 'installed', 'progress': 100}
+                      self._send(200, STATE['pre_enrollment'])
+                  elif self.path == '/internal/mgmt/restart-service':
+                      self._send(200, {'status': 'restarted'})
+                  else:
+                      self._send(404, {'error': 'not found'})
+
+              def do_PUT(self):
+                  length = int(self.headers.get('Content-Length', 0))
+                  body = json.loads(self.rfile.read(length)) if length else {}
+                  if self.path == '/enrollment':
+                      token = body.get('token', '')
+                      STATE['enrollment'] = {
+                          'status': 'completed',
+                          'gateway_id': 'test-gw-001',
+                          'token_received': token[:8] + '...' if len(token) > 8 else token,
+                      }
+                      self._send(200, STATE['enrollment'])
+                  else:
+                      self._send(404, {'error': 'not found'})
+
+              def log_message(self, fmt, *args):
+                  print(f"[API] {args[0]}")
+
+          if __name__ == '__main__':
+              server = HTTPServer(('127.0.0.1', 8080), Handler)
+              print('API server listening on 127.0.0.1:8080')
+              server.serve_forever()
+          APIEOF
+
+          chmod +x /opt/api-server.py
+
+          cat > /etc/systemd/system/test-api.service << 'SVCEOF'
+          [Unit]
+          Description=Test API server on localhost:8080
+          After=network.target
+
+          [Service]
+          ExecStart=/usr/bin/python3 /opt/api-server.py
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+          SVCEOF
+
+          systemctl daemon-reload
+          systemctl enable test-api
+          systemctl start test-api
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-instance'
+
+  # =========================================================
+  # Test Lambda (SSH tunnel client)
+  # =========================================================
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Lambda SSH tunnel test
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+          Description: All outbound
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-lambda-sg'
+
+  TestLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SSHTunnelTest
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref SSHPrivateKeySecret
+              - Effect: Allow
+                Action:
+                  - ec2:CreateNetworkInterface
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DeleteNetworkInterface
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  TestLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-ssh-test'
+      Runtime: python3.12
+      Handler: lambda_function.handler
+      Timeout: 120
+      MemorySize: 256
+      Role: !GetAtt TestLambdaRole.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref SubnetId
+      Environment:
+        Variables:
+          SSH_KEY_SECRET_ARN: !Ref SSHPrivateKeySecret
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref LambdaCodeKey
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-ssh-test'
+
+  # =========================================================
+  # VPC Endpoint for Secrets Manager (Lambda in VPC)
+  # =========================================================
+
+  VpcEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: VPC endpoints - allow HTTPS from Lambda
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+          Description: HTTPS from Lambda
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-vpce-sg'
+
+  SecretsManagerVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.secretsmanager'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+
+  # =========================================================
+  # pexpect Lambda Layer (pexpect + pyte + ssh binary)
+  # =========================================================
+
+  PexpectLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub '${AWS::StackName}-pexpect'
+      Description: >
+        pexpect, ptyprocess, pyte Python packages and OpenSSH client binary.
+        Enables interactive SSH sessions from Lambda using pseudo-terminals.
+      CompatibleRuntimes:
+        - python3.12
+      Content:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref PexpectLayerKey
+
+  # =========================================================
+  # TUI Test Lambda (pexpect SSH feasibility test)
+  # =========================================================
+
+  TuiTestLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-tui-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: TuiTestPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref SSHPrivateKeySecret
+              - Effect: Allow
+                Action:
+                  - ec2:CreateNetworkInterface
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DeleteNetworkInterface
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  TuiTestLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-tui-test'
+      Description: >
+        Feasibility test: pexpect + pyte TUI interaction over SSH from Lambda.
+        NOT triggered automatically — invoke manually from the console.
+      Runtime: python3.12
+      Handler: lambda_tui_test.handler
+      Timeout: 120
+      MemorySize: 256
+      Role: !GetAtt TuiTestLambdaRole.Arn
+      Layers:
+        - !Ref PexpectLayer
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref SubnetId
+      Environment:
+        Variables:
+          SSH_KEY_SECRET_ARN: !Ref SSHPrivateKeySecret
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref TuiLambdaCodeKey
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-tui-test'
+
+Outputs:
+  InstanceId:
+    Value: !Ref TestInstance
+  PublicIp:
+    Value: !GetAtt TestInstance.PublicIp
+  PrivateIp:
+    Value: !GetAtt TestInstance.PrivateIp
+  LambdaFunctionName:
+    Value: !Ref TestLambdaFunction
+  SSHKeyPairName:
+    Value: !Sub '${AWS::StackName}-key'
+  SSHPrivateKeySecretArn:
+    Value: !Ref SSHPrivateKeySecret
+  TuiTestLambdaFunctionName:
+    Value: !Ref TuiTestLambdaFunction
+  TestEvent:
+    Description: Paste this into the SSH tunnel Lambda console test event
+    Value: !Sub '{"instance_ip": "${TestInstance.PrivateIp}"}'
+  TuiTestEvent:
+    Description: Paste this into the TUI test Lambda console test event (key auth to test instance)
+    Value: !Sub '{"instance_ip": "${TestInstance.PrivateIp}", "username": "ubuntu", "auth_method": "key"}'
+  TuiTestEventPassword:
+    Description: TUI test event for password auth (use with a real gateway instance IP)
+    Value: '{"instance_ip": "<GATEWAY_PRIVATE_IP>", "username": "nsadmin", "auth_method": "password", "password": "nsadmin"}'

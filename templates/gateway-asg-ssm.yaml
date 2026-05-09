@@ -31,6 +31,7 @@ Metadata:
         Parameters:
           - GatewayAmiId
           - InstanceType
+          - KeyPairName
       - Label:
           default: Load Balancer Configuration
         Parameters:
@@ -69,6 +70,8 @@ Metadata:
         default: Gateway AMI ID
       InstanceType:
         default: Gateway Instance Type
+      KeyPairName:
+        default: SSH Key Pair Name
       ExistingPublicSubnet2Id:
         default: Existing Public Subnet 2 ID (AZ 2)
       PublicSubnet2Cidr:
@@ -213,6 +216,10 @@ Parameters:
       - m6i.4xlarge
       - c5.4xlarge
     Description: EC2 instance type for the gateway (minimum 16 vCPU, 64 GiB RAM)
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: SSH key pair for gateway instance access
 
   DlpHostUrl:
     Type: String
@@ -497,15 +504,11 @@ Resources:
 
   VpcEndpointSecurityGroup:
     Type: AWS::EC2::SecurityGroup
+    Condition: CreateNewVpc
     Properties:
-      GroupDescription: VPC interface endpoints - HTTPS from Lambda and VPC
-      VpcId: !If [CreateNewVpc, !Ref Vpc, !Ref ExistingVpcId]
+      GroupDescription: VPC interface endpoints - HTTPS from VPC
+      VpcId: !Ref Vpc
       SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 443
-          ToPort: 443
-          SourceSecurityGroupId: !Ref LambdaSecurityGroup
-          Description: HTTPS from enrollment Lambda
         - IpProtocol: tcp
           FromPort: 443
           ToPort: 443
@@ -534,8 +537,9 @@ Resources:
 
   SecretsManagerEndpoint:
     Type: AWS::EC2::VPCEndpoint
+    Condition: CreateNewVpc
     Properties:
-      VpcId: !If [CreateNewVpc, !Ref Vpc, !Ref ExistingVpcId]
+      VpcId: !Ref Vpc
       ServiceName: !Sub 'com.amazonaws.${AWS::Region}.secretsmanager'
       VpcEndpointType: Interface
       PrivateDnsEnabled: true
@@ -609,11 +613,6 @@ Resources:
           ToPort: 443
           CidrIp: !Ref VpcCidr
           Description: HTTPS from VPC consumers
-        - IpProtocol: tcp
-          FromPort: 22
-          ToPort: 22
-          SourceSecurityGroupId: !Ref LambdaSecurityGroup
-          Description: SSH from enrollment Lambda
         - IpProtocol: tcp
           FromPort: 22
           ToPort: 22
@@ -892,21 +891,18 @@ Resources:
     DependsOn: ActivationLambdaLogGroup
     Properties:
       FunctionName: !Sub '${AWS::StackName}-activation'
-      Description: >
-        Handles ASG lifecycle events. On launch: registers appliance with
-        Netskope tenant and starts Step Functions enrollment. On terminate:
-        deregisters appliance and cleans up.
+      Description: Creates/deletes Netskope AI Gateway appliance and enrollment token
       Runtime: python3.12
       Handler: index.handler
       Timeout: 300
       MemorySize: 128
-      ReservedConcurrentExecutions: 5
+      ReservedConcurrentExecutions: 1
       Role: !GetAtt ActivationLambdaRole.Arn
       Environment:
         Variables:
           STACK_NAME: !Ref 'AWS::StackName'
           SECRET_ARN: !Ref NetskopeSecret
-          STATE_MACHINE_ARN: !Ref EnrollmentStateMachine
+          DLP_HOST_URL: !Ref DlpHostUrl
       Code:
         ZipFile: |
           import json
@@ -923,15 +919,14 @@ Resources:
           ssm = boto3.client('ssm')
           ec2_client = boto3.client('ec2')
           asg_client = boto3.client('autoscaling')
-          sfn_client = boto3.client('stepfunctions')
 
-          def get_instance_private_ip(instance_id):
+          def get_instance_public_ip(instance_id):
               resp = ec2_client.describe_instances(InstanceIds=[instance_id])
               reservations = resp.get('Reservations', [])
               if reservations:
                   instances = reservations[0].get('Instances', [])
                   if instances:
-                      return instances[0].get('PrivateIpAddress', 'unknown')
+                      return instances[0].get('PublicIpAddress') or instances[0].get('PrivateIpAddress', 'unknown')
               return 'unknown'
 
           def complete_lifecycle_action(detail, result='CONTINUE'):
@@ -962,7 +957,69 @@ Resources:
                   logger.error('API %s %s -> %s: %s', method, path, e.code, error_body)
                   raise
 
-          def register_appliance(tenant_url, api_token, appliance_name, instance_ip):
+          def write_token_to_ssm(stack_name, instance_id, token):
+              param_name = f'/aig/{stack_name}/{instance_id}/enrollment-token'
+              ssm.put_parameter(
+                  Name=param_name,
+                  Value=token,
+                  Type='SecureString',
+                  Overwrite=True,
+              )
+              logger.info('Wrote enrollment token to %s', param_name)
+
+          def wait_for_ssm_agent(instance_id, timeout=240):
+              """Poll until the instance is registered with SSM."""
+              import time
+              deadline = time.time() + timeout
+              while time.time() < deadline:
+                  resp = ssm.describe_instance_information(
+                      Filters=[{'Key': 'InstanceIds', 'Values': [instance_id]}]
+                  )
+                  instances = resp.get('InstanceInformationList', [])
+                  if instances and instances[0].get('PingStatus') == 'Online':
+                      logger.info('SSM agent online for %s', instance_id)
+                      return True
+                  logger.info('Waiting for SSM agent on %s...', instance_id)
+                  time.sleep(15)
+              return False
+
+          def send_setup_command(instance_id, stack_name, dlp_host,
+                                  lifecycle_hook_name='', asg_name='', lifecycle_token=''):
+              """Wait for SSM agent, then invoke the SSM Automation document."""
+              if not wait_for_ssm_agent(instance_id):
+                  raise RuntimeError(f'SSM agent not online for {instance_id} after waiting')
+
+              doc_name = f'{stack_name}-setup'
+              # SSM parameters don't accept empty strings — omit optional params if empty
+              params = {
+                  'InstanceId': [instance_id],
+                  'StackName': [stack_name],
+              }
+              if dlp_host:
+                  params['DlpHostUrl'] = [dlp_host]
+              if lifecycle_hook_name:
+                  params['LifecycleHookName'] = [lifecycle_hook_name]
+              if asg_name:
+                  params['AutoScalingGroupName'] = [asg_name]
+              if lifecycle_token:
+                  params['LifecycleActionToken'] = [lifecycle_token]
+              resp = ssm.start_automation_execution(
+                  DocumentName=doc_name,
+                  Parameters=params,
+              )
+              exec_id = resp['AutomationExecutionId']
+              logger.info('Started automation %s (doc=%s) for %s', exec_id, doc_name, instance_id)
+              return exec_id
+
+          def delete_token_from_ssm(stack_name, instance_id):
+              param_name = f'/aig/{stack_name}/{instance_id}/enrollment-token'
+              try:
+                  ssm.delete_parameter(Name=param_name)
+                  logger.info('Deleted parameter %s', param_name)
+              except ssm.exceptions.ParameterNotFound:
+                  pass
+
+          def register_appliance(tenant_url, api_token, appliance_name, public_ip):
               """Register appliance with Netskope tenant and return (appliance_id, enrollment_token)."""
               appliance = api_request(
                   tenant_url,
@@ -971,7 +1028,7 @@ Resources:
                   method='POST',
                   body={
                       'name': appliance_name,
-                      'host': instance_ip,
+                      'host': public_ip,
                       'ports': {
                           'https': {'port': 443, 'enable': True},
                           'http': {'port': 80, 'enable': False},
@@ -1012,48 +1069,29 @@ Resources:
               except Exception:
                   logger.exception('Delete failed for appliance %s — continuing', appliance_id)
 
-          def start_enrollment(instance_id, instance_ip, appliance_id, enrollment_token,
-                               lifecycle_detail=None):
-              """Start the Step Functions enrollment state machine."""
-              state_machine_arn = os.environ['STATE_MACHINE_ARN']
-              sfn_input = {
-                  'instance_ip': instance_ip,
-                  'appliance_id': appliance_id,
-                  'enrollment_token': enrollment_token,
-              }
-              if lifecycle_detail:
-                  sfn_input['lifecycle'] = {
-                      'hook_name': lifecycle_detail.get('LifecycleHookName', ''),
-                      'asg_name': lifecycle_detail.get('AutoScalingGroupName', ''),
-                      'action_token': lifecycle_detail.get('LifecycleActionToken', ''),
-                  }
-              resp = sfn_client.start_execution(
-                  stateMachineArn=state_machine_arn,
-                  name=f'enroll-{instance_id}',
-                  input=json.dumps(sfn_input),
-              )
-              logger.info('Started enrollment %s for %s', resp['executionArn'], instance_id)
-              return resp['executionArn']
-
           def handle_lifecycle_event(event, context):
               """Handle ASG lifecycle hook events (launch/terminate)."""
+              # SNS format has fields at top level; EventBridge wraps in 'detail'
               detail = event.get('detail', event)
               instance_id = detail['EC2InstanceId']
               transition = detail['LifecycleTransition']
 
               stack_name = os.environ['STACK_NAME']
               secret_arn = os.environ['SECRET_ARN']
+              dlp_host = os.environ.get('DLP_HOST_URL', '')
 
               try:
                   if transition == 'autoscaling:EC2_INSTANCE_LAUNCHING':
                       secret = get_secret(secret_arn)
-                      instance_ip = get_instance_private_ip(instance_id)
+                      public_ip = get_instance_public_ip(instance_id)
                       appliance_name = f'{stack_name}-gw-{instance_id}'
 
                       appliance_id, enrollment_token = register_appliance(
                           secret['tenant_url'], secret['api_token'],
-                          appliance_name, instance_ip,
+                          appliance_name, public_ip,
                       )
+
+                      write_token_to_ssm(stack_name, instance_id, enrollment_token)
 
                       # Store appliance ID for cleanup on termination
                       ssm.put_parameter(
@@ -1061,22 +1099,24 @@ Resources:
                           Value=appliance_id, Type='String', Overwrite=True,
                       )
 
-                      # Start Step Functions enrollment — it will complete
+                      # Pass lifecycle details to SSM automation — it will complete
                       # the lifecycle action after enrollment succeeds
                       try:
-                          start_enrollment(
-                              instance_id, instance_ip,
-                              appliance_id, enrollment_token,
-                              lifecycle_detail=detail,
+                          send_setup_command(
+                              instance_id, stack_name, dlp_host,
+                              lifecycle_hook_name=detail.get('LifecycleHookName', ''),
+                              asg_name=detail.get('AutoScalingGroupName', ''),
+                              lifecycle_token=detail.get('LifecycleActionToken', ''),
                           )
                       except Exception:
-                          logger.exception('Step Functions start failed — abandoning lifecycle')
+                          logger.exception('SSM setup failed — abandoning lifecycle')
                           try:
                               complete_lifecycle_action(detail, 'ABANDON')
                           except Exception:
                               logger.exception('Failed to abandon lifecycle action')
 
                   elif transition == 'autoscaling:EC2_INSTANCE_TERMINATING':
+                      # Get stored appliance ID
                       appliance_id = None
                       try:
                           resp = ssm.get_parameter(Name=f'/aig/{stack_name}/{instance_id}/appliance-id')
@@ -1089,6 +1129,7 @@ Resources:
                           deregister_appliance(secret['tenant_url'], secret['api_token'], appliance_id)
 
                       # Clean up SSM parameters
+                      delete_token_from_ssm(stack_name, instance_id)
                       try:
                           ssm.delete_parameter(Name=f'/aig/{stack_name}/{instance_id}/appliance-id')
                       except Exception:
@@ -1113,25 +1154,35 @@ Resources:
                       secret = get_secret(props['SecretArn'])
                       instance_id = props['InstanceId']
                       stack_name = props['StackName']
-                      instance_ip = props.get('InstanceIp', props.get('PublicIp', 'unknown'))
+                      public_ip = props.get('PublicIp', 'unknown')
                       appliance_name = props['ApplianceName']
 
                       appliance_id, enrollment_token = register_appliance(
                           secret['tenant_url'], secret['api_token'],
-                          appliance_name, instance_ip,
+                          appliance_name, public_ip,
                       )
 
+                      write_token_to_ssm(stack_name, instance_id, enrollment_token)
+
+                      dlp_host = props.get('DlpHostUrl', '')
                       try:
-                          start_enrollment(instance_id, instance_ip, appliance_id, enrollment_token)
+                          send_setup_command(instance_id, stack_name, dlp_host)
                       except Exception:
-                          logger.exception('Step Functions start failed — instance may need manual enrollment')
+                          logger.exception('SSM setup failed — instance may need manual setup')
 
                       cfnresponse.send(event, context, cfnresponse.SUCCESS, {
                           'ApplianceId': appliance_id,
+                          'EnrollmentToken': enrollment_token,
                       }, physicalResourceId=appliance_id)
 
                   elif request_type == 'Delete':
                       appliance_id = event.get('PhysicalResourceId', '')
+                      instance_id = props.get('InstanceId', '')
+                      stack_name = props.get('StackName', '')
+
+                      if instance_id and stack_name:
+                          delete_token_from_ssm(stack_name, instance_id)
+
                       if appliance_id and not appliance_id.startswith('arn:'):
                           secret = get_secret(props['SecretArn'])
                           deregister_appliance(secret['tenant_url'], secret['api_token'], appliance_id)
@@ -1154,12 +1205,15 @@ Resources:
               if 'Records' in event and event['Records'][0].get('EventSource') == 'aws:sns':
                   message = json.loads(event['Records'][0]['Sns']['Message'])
                   logger.info('SNS lifecycle message: %s', json.dumps(message, default=str))
+                  # Skip test notifications sent when SNS subscription is created
                   if message.get('Event') == 'autoscaling:TEST_NOTIFICATION':
                       logger.info('Skipping test notification')
                       return
                   return handle_lifecycle_event(message, context)
+              # EventBridge lifecycle event (direct)
               elif 'detail' in event and 'LifecycleTransition' in event.get('detail', {}):
                   return handle_lifecycle_event(event.get('detail', event), context)
+              # CFN Custom Resource event
               elif 'RequestType' in event:
                   return handle_cfn_event(event, context)
               else:
@@ -1171,319 +1225,6 @@ Resources:
           Value: !Ref Environment
         - Key: ManagedBy
           Value: CloudFormation
-
-  # ============================================================
-  # Enrollment Lambda (SSH/TUI — runs in VPC)
-  # ============================================================
-
-  EnrollmentLambdaLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-enrollment'
-      RetentionInDays: 30
-      Tags:
-        - Key: Project
-          Value: !Ref Project
-        - Key: Environment
-          Value: !Ref Environment
-        - Key: ManagedBy
-          Value: CloudFormation
-
-  EnrollmentLambdaRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub '${AWS::StackName}-enrollment-lambda-role'
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: EnrollmentLambdaPolicy
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Sid: GetSSHKey
-                Effect: Allow
-                Action:
-                  - secretsmanager:GetSecretValue
-                Resource: !Ref SSHPrivateKeySecret
-              - Sid: GetNetskopeSecret
-                Effect: Allow
-                Action:
-                  - secretsmanager:GetSecretValue
-                Resource: !Ref NetskopeSecret
-              - Sid: VpcNetworking
-                Effect: Allow
-                Action:
-                  - ec2:CreateNetworkInterface
-                  - ec2:DescribeNetworkInterfaces
-                  - ec2:DeleteNetworkInterface
-                Resource: '*'
-              - Sid: CompleteLifecycleAction
-                Effect: Allow
-                Action:
-                  - autoscaling:CompleteLifecycleAction
-                Resource: !Sub 'arn:aws:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/${AWS::StackName}-*'
-              - Sid: WriteLogs
-                Effect: Allow
-                Action:
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
-                Resource: !GetAtt EnrollmentLambdaLogGroup.Arn
-      Tags:
-        - Key: Project
-          Value: !Ref Project
-        - Key: Environment
-          Value: !Ref Environment
-        - Key: ManagedBy
-          Value: CloudFormation
-
-  ParamikoLayer:
-    Type: AWS::Lambda::LayerVersion
-    Properties:
-      LayerName: !Sub '${AWS::StackName}-paramiko'
-      Description: paramiko + pyte for TUI automation over SSH
-      CompatibleRuntimes:
-        - python3.12
-      Content:
-        S3Bucket: !Ref LambdaCodeBucket
-        S3Key: !Ref LambdaLayerKey
-
-  EnrollmentLambdaFunction:
-    Type: AWS::Lambda::Function
-    DependsOn: EnrollmentLambdaLogGroup
-    Properties:
-      FunctionName: !Sub '${AWS::StackName}-enrollment'
-      Description: Drives gateway enrollment via TUI over SSH (paramiko + pyte)
-      Runtime: python3.12
-      Handler: step_function_handlers.handler
-      Timeout: 120
-      MemorySize: 256
-      Role: !GetAtt EnrollmentLambdaRole.Arn
-      Layers:
-        - !Ref ParamikoLayer
-      VpcConfig:
-        SecurityGroupIds:
-          - !Ref LambdaSecurityGroup
-        SubnetIds:
-          - !If [CreateNewPrivateSubnet, !Ref PrivateSubnet, !Ref ExistingPrivateSubnetId]
-          - !If [CreateNewPrivateSubnet2, !Ref PrivateSubnet2, !Ref ExistingPrivateSubnet2Id]
-      Environment:
-        Variables:
-          SSH_KEY_SECRET_ARN: !Ref SSHPrivateKeySecret
-          NETSKOPE_SECRET_ARN: !Ref NetskopeSecret
-      Code:
-        S3Bucket: !Ref LambdaCodeBucket
-        S3Key: !Ref LambdaCodeKey
-      Tags:
-        - Key: Project
-          Value: !Ref Project
-        - Key: Environment
-          Value: !Ref Environment
-        - Key: ManagedBy
-          Value: CloudFormation
-
-  # ============================================================
-  # Step Functions — Enrollment State Machine
-  # ============================================================
-
-  StepFunctionRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub '${AWS::StackName}-sfn-role'
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: states.amazonaws.com
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: InvokeLambda
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - lambda:InvokeFunction
-                Resource:
-                  - !GetAtt EnrollmentLambdaFunction.Arn
-      Tags:
-        - Key: Project
-          Value: !Ref Project
-        - Key: Environment
-          Value: !Ref Environment
-        - Key: ManagedBy
-          Value: CloudFormation
-
-  EnrollmentStateMachine:
-    Type: AWS::StepFunctions::StateMachine
-    Properties:
-      StateMachineName: !Sub '${AWS::StackName}-enrollment'
-      RoleArn: !GetAtt StepFunctionRole.Arn
-      Tags:
-        - Key: Project
-          Value: !Ref Project
-        - Key: Environment
-          Value: !Ref Environment
-        - Key: ManagedBy
-          Value: CloudFormation
-      DefinitionString: !Sub |
-        {
-          "Comment": "AIG Gateway enrollment via TUI automation over SSH",
-          "StartAt": "WaitForSSH",
-          "States": {
-            "WaitForSSH": {
-              "Type": "Task",
-              "Resource": "${EnrollmentLambdaFunction.Arn}",
-              "Parameters": {
-                "action": "check_ssh",
-                "instance_ip.$": "$.instance_ip",
-                "appliance_id.$": "$.appliance_id",
-                "enrollment_token.$": "$.enrollment_token"
-              },
-              "ResultPath": "$.ssh_check",
-              "Next": "IsSSHReady",
-              "Catch": [{
-                "ErrorEquals": ["States.ALL"],
-                "Next": "WaitBeforeSSHRetry",
-                "ResultPath": "$.error"
-              }]
-            },
-            "IsSSHReady": {
-              "Type": "Choice",
-              "Choices": [{
-                "Variable": "$.ssh_check.ssh_ready",
-                "BooleanEquals": true,
-                "Next": "StartEnrollment"
-              }],
-              "Default": "WaitBeforeSSHRetry"
-            },
-            "WaitBeforeSSHRetry": {
-              "Type": "Wait",
-              "Seconds": 15,
-              "Next": "WaitForSSH"
-            },
-            "StartEnrollment": {
-              "Type": "Task",
-              "Resource": "${EnrollmentLambdaFunction.Arn}",
-              "Parameters": {
-                "action": "start_enrollment",
-                "instance_ip.$": "$.ssh_check.instance_ip",
-                "appliance_id.$": "$.ssh_check.appliance_id",
-                "enrollment_token.$": "$.ssh_check.enrollment_token"
-              },
-              "ResultPath": "$.enrollment",
-              "Next": "CheckEnrollmentState",
-              "Catch": [{
-                "ErrorEquals": ["States.ALL"],
-                "Next": "EnrollmentFailed",
-                "ResultPath": "$.error"
-              }]
-            },
-            "CheckEnrollmentState": {
-              "Type": "Choice",
-              "Choices": [
-                {
-                  "Variable": "$.enrollment.enrollment_state",
-                  "StringEquals": "token_prompt_ready",
-                  "Next": "SubmitToken"
-                },
-                {
-                  "Variable": "$.enrollment.enrollment_state",
-                  "StringEquals": "already_enrolled",
-                  "Next": "EnrollmentComplete"
-                },
-                {
-                  "Variable": "$.enrollment.enrollment_state",
-                  "StringEquals": "completed",
-                  "Next": "EnrollmentComplete"
-                }
-              ],
-              "Default": "WaitForPreEnrollment"
-            },
-            "WaitForPreEnrollment": {
-              "Type": "Wait",
-              "Seconds": 30,
-              "Next": "PollPreEnrollment"
-            },
-            "PollPreEnrollment": {
-              "Type": "Task",
-              "Resource": "${EnrollmentLambdaFunction.Arn}",
-              "Parameters": {
-                "action": "check_enrollment",
-                "instance_ip.$": "$.enrollment.instance_ip",
-                "appliance_id.$": "$.enrollment.appliance_id",
-                "enrollment_token.$": "$.enrollment.enrollment_token"
-              },
-              "ResultPath": "$.enrollment",
-              "Next": "CheckEnrollmentState",
-              "Catch": [{
-                "ErrorEquals": ["States.ALL"],
-                "Next": "WaitForPreEnrollment",
-                "ResultPath": "$.error"
-              }]
-            },
-            "SubmitToken": {
-              "Type": "Task",
-              "Resource": "${EnrollmentLambdaFunction.Arn}",
-              "Parameters": {
-                "action": "submit_token",
-                "instance_ip.$": "$.enrollment.instance_ip",
-                "appliance_id.$": "$.enrollment.appliance_id",
-                "enrollment_token.$": "$.enrollment.enrollment_token"
-              },
-              "ResultPath": "$.submit_result",
-              "Next": "CheckSubmitResult",
-              "Catch": [{
-                "ErrorEquals": ["States.ALL"],
-                "Next": "EnrollmentFailed",
-                "ResultPath": "$.error"
-              }]
-            },
-            "CheckSubmitResult": {
-              "Type": "Choice",
-              "Choices": [
-                {
-                  "Variable": "$.submit_result.enrollment_state",
-                  "StringEquals": "completed",
-                  "Next": "EnrollmentComplete"
-                },
-                {
-                  "Variable": "$.submit_result.enrollment_state",
-                  "StringEquals": "already_enrolled",
-                  "Next": "EnrollmentComplete"
-                }
-              ],
-              "Default": "EnrollmentFailed"
-            },
-            "EnrollmentComplete": {
-              "Type": "Task",
-              "Resource": "${EnrollmentLambdaFunction.Arn}",
-              "Parameters": {
-                "action": "complete_lifecycle",
-                "lifecycle.$": "$.lifecycle"
-              },
-              "End": true,
-              "Catch": [{
-                "ErrorEquals": ["States.ALL"],
-                "Next": "EnrollmentSucceededLifecycleFailed",
-                "ResultPath": "$.lifecycle_error"
-              }]
-            },
-            "EnrollmentSucceededLifecycleFailed": {
-              "Type": "Succeed"
-            },
-            "EnrollmentFailed": {
-              "Type": "Fail",
-              "Error": "EnrollmentFailed",
-              "Cause": "Enrollment did not complete successfully"
-            }
-          }
-        }
 
   # ============================================================
   # Application Load Balancer
@@ -1556,7 +1297,7 @@ Resources:
       LaunchTemplateData:
         ImageId: !Ref GatewayAmiId
         InstanceType: !Ref InstanceType
-        KeyName: !Sub '${AWS::StackName}-key'
+        KeyName: !Ref KeyPairName
         SecurityGroupIds:
           - !Ref GatewaySecurityGroup
         IamInstanceProfile:
@@ -1584,9 +1325,6 @@ Resources:
 
   GatewayAutoScalingGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
-    DependsOn:
-      - LifecycleSnsSubscription
-      - LambdaLifecyclePermission
     Properties:
       AutoScalingGroupName: !Sub '${AWS::StackName}-asg'
       LaunchTemplate:
@@ -1605,7 +1343,7 @@ Resources:
       LifecycleHookSpecificationList:
         - LifecycleHookName: !Sub '${AWS::StackName}-launch-hook'
           LifecycleTransition: 'autoscaling:EC2_INSTANCE_LAUNCHING'
-          HeartbeatTimeout: 3600
+          HeartbeatTimeout: 900
           DefaultResult: ABANDON
           NotificationTargetARN: !Ref LifecycleSnsTopic
           RoleARN: !GetAtt LifecycleSnsRole.Arn

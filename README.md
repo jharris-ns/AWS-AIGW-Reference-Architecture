@@ -2,7 +2,13 @@
 
 ## Overview
 
-This CloudFormation template (`templates/gateway-asg.yaml`) deploys the Netskope AI Gateway as an auto-scaling cluster behind an Application Load Balancer. It automates appliance enrollment, DLP configuration, and lifecycle management so that instances are fully configured before receiving traffic and cleanly deregistered on termination.
+This CloudFormation template (`templates/gateway-asg.yaml`) deploys two services:
+
+**AI Gateway Service** — An Auto Scaling Group of Netskope AI Gateway instances behind an internet-facing Application Load Balancer. Each instance is automatically enrolled with the Netskope tenant, configured for DLP inspection, and placed into service — no manual setup required. The ASG scales independently based on capacity parameters.
+
+**DLP On Demand Service (Optional)** — When `DlpodAmiId` is provided, a second Auto Scaling Group of DLP On Demand (DLPoD) appliances is deployed behind a private internal ALB with a Route 53 private hosted zone (`dlp.aigw.internal`). Each DLPoD instance is automatically tethered to the Netskope management plane via lifecycle hooks. The AI Gateway instances are configured to forward content to the DLPoD service for inline DLP inspection.
+
+Both services use the same lifecycle automation pattern: ASG lifecycle hooks trigger Lambda functions that orchestrate configuration via Step Functions. TLS certificates for both ALBs are automatically generated at stack creation. Each service scales independently through its own ASG.
 
 This repository includes a `CLAUDE.md` file that provides [Claude Code](https://docs.anthropic.com/en/docs/claude-code) with full project context. Claude Code can assist with deploying stacks, reading logs, diagnosing enrollment failures, and managing scaling operations. See [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) for usage examples.
 

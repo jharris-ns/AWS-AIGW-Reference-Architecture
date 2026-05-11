@@ -315,20 +315,68 @@ aws stepfunctions start-execution \
 
 ### When using an existing VPC
 
-The template creates a Secrets Manager VPC endpoint in all deployments (both new and existing VPCs). For existing VPCs, the following must also be available:
+The template requires **four subnets** — two public and two private, each pair in different availability zones.
 
-| Endpoint | Type | Required by |
-|----------|------|------------|
-| `com.amazonaws.<region>.secretsmanager` | Interface | Enrollment Lambda (reads SSH key from Secrets Manager) |
-| `com.amazonaws.<region>.s3` | Gateway | Lambda Layer downloads |
+#### Public subnets (ALB)
 
-The endpoint security groups must allow HTTPS (443) inbound from the Lambda security group or VPC CIDR. The template creates a dedicated security group (`{stack}-vpce-sg`) with rules for both.
+- Must have a route to an **internet gateway** (the ALB is internet-facing)
+- Two subnets in different AZs (ALB multi-AZ requirement)
+- These subnets only host the ALB ENIs, not the gateway instances
 
-**Important:** The Enrollment Lambda must be in private subnets with a NAT gateway for outbound internet access (needed to call `CompleteLifecycleAction` and for general AWS API access).
+#### Private subnets (gateway instances + Lambda)
+
+The private subnets host both the gateway instances and the Enrollment Lambda ENIs. They must meet all of the following requirements:
+
+| Requirement | Why |
+|---|---|
+| Route to a **NAT gateway** (`0.0.0.0/0` → NAT) | Gateway instances need outbound internet for Netskope tenant policy sync, LLM provider API calls, and DLPoD connectivity. The Enrollment Lambda needs internet for `CompleteLifecycleAction` and other AWS API calls. |
+| Two subnets in **different AZs** | Multi-AZ placement for both gateway instances (ASG) and Lambda ENIs (HA). |
+| **DNS support** enabled on the VPC | `EnableDnsSupport: true`, `EnableDnsHostnames: true`. Required for VPC endpoint private DNS resolution. |
+| No **NACLs** blocking port 22 between subnets | The Enrollment Lambda SSHes to gateway instances on port 22. Default NACLs allow all traffic; custom NACLs must permit TCP 22 between the private subnets. |
+| No **NACLs** blocking port 443 outbound | Both the Lambda and gateway instances need outbound HTTPS to AWS APIs and the Netskope tenant. |
+
+#### VPC endpoints
+
+The template creates a Secrets Manager VPC endpoint in all deployments. For existing VPCs, verify the following are available or will be created:
+
+| Endpoint | Type | Required by | Created by template? |
+|----------|------|------------|---------------------|
+| `com.amazonaws.<region>.secretsmanager` | Interface | Enrollment Lambda (reads SSH key) | Yes (always) |
+| `com.amazonaws.<region>.s3` | Gateway | Lambda Layer downloads, general S3 ops | Only with new VPC |
+
+The Secrets Manager VPC endpoint security group must allow **HTTPS (443) inbound** from the Lambda security group. The template creates a dedicated security group (`{stack}-vpce-sg`) with this rule.
+
+If the existing VPC already has a Secrets Manager endpoint, the template deployment will fail with a `PrivateDnsEnabled` conflict. In this case, either:
+- Remove the existing endpoint before deploying, or
+- Remove the `SecretsManagerEndpoint` resource from the template and ensure the existing endpoint's security group allows the Lambda SG
+
+#### Verification checklist
+
+Before deploying into an existing VPC, verify:
+
+```bash
+# Check VPC DNS settings
+aws ec2 describe-vpc-attribute --vpc-id <vpc-id> --attribute enableDnsSupport
+aws ec2 describe-vpc-attribute --vpc-id <vpc-id> --attribute enableDnsHostnames
+
+# Check private subnet route tables have NAT gateway
+aws ec2 describe-route-tables --filters "Name=association.subnet-id,Values=<priv-subnet-id>" \
+  --query "RouteTables[0].Routes[?DestinationCidrBlock=='0.0.0.0/0'].NatGatewayId" --output text
+
+# Check for existing Secrets Manager VPC endpoint (will conflict)
+aws ec2 describe-vpc-endpoints --filters "Name=vpc-id,Values=<vpc-id>" \
+  "Name=service-name,Values=com.amazonaws.<region>.secretsmanager" \
+  --query "VpcEndpoints[*].[VpcEndpointId,State]" --output text
+```
 
 ### When creating a new VPC
 
-The template automatically creates the VPC with public subnets (ALB, NAT gateway), private subnets (gateways, Lambda), internet gateway, NAT gateway, S3 gateway endpoint, and Secrets Manager interface endpoint.
+The template automatically creates the VPC with:
+- 2 public subnets (ALB, NAT gateway) across 2 AZs
+- 2 private subnets (gateway instances, Lambda) across 2 AZs
+- Internet gateway, NAT gateway, route tables
+- S3 gateway endpoint, Secrets Manager interface endpoint
+- VPC endpoint security group allowing HTTPS from Lambda SG and VPC CIDR
 
 ---
 

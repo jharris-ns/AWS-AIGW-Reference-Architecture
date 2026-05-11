@@ -1,0 +1,41 @@
+# Build artifacts
+*.zip
+*.bak
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# Dev-only docs (not shipped to customers)
+docs/SSH_TUNNEL_PROPOSAL.md
+docs/TUI_ENROLLMENT_PLAN.md
+
+# Dev-only scripts and templates
+scripts/lambda_function.py
+scripts/lambda_tui_test.py
+scripts/test-ssh-tunnel.py
+scripts/build-lambda.sh
+scripts/build-tui-lambda.sh
+scripts/requirements.txt
+templates/gateway-asg-ssm.yaml
+templates/test-ssh-tunnel.yaml
+templates/test-step-function.yaml
+
+# Local TUI files (pexpect-based, not used in Lambda)
+libs/tui/config.py
+libs/tui/config_publickey.py
+libs/tui/tui_helpers.py
+libs/tui/tui_session.py
+libs/tui/tui_session_publickey.py
+libs/tui/base_test.py
+libs/tui/utils/__init__.py
+libs/tui/utils/enrollment.py
+libs/tui/utils/csr.py

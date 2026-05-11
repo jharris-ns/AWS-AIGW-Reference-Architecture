@@ -1,13 +1,16 @@
 #!/bin/bash
 set -euo pipefail
 #
-# Upload CloudFormation template and Lambda artifacts to S3.
+# Build and upload Lambda artifacts to S3.
 #
 # Usage:
 #   scripts/deploy-artifacts.sh [region]
 #
 # Creates the S3 bucket if it doesn't exist, builds the Lambda
-# package and Layer if not already built, and uploads everything.
+# packages and Layer if not already built, and uploads everything.
+#
+# The template is under 51KB and can be deployed directly with
+# --template-body — no S3 upload needed for the template itself.
 #
 
 REGION="${1:-us-west-1}"
@@ -29,10 +32,17 @@ else
   echo "Bucket exists"
 fi
 
-# Build Lambda package if missing
+# Build activation Lambda if missing
+if [ ! -f "$SCRIPT_DIR/lambda-activation.zip" ]; then
+  echo ""
+  echo "Building Activation Lambda..."
+  bash "$SCRIPT_DIR/build-activation-lambda.sh"
+fi
+
+# Build enrollment Lambda if missing
 if [ ! -f "$SCRIPT_DIR/lambda-step-function.zip" ]; then
   echo ""
-  echo "Building Lambda package..."
+  echo "Building Enrollment Lambda..."
   bash "$SCRIPT_DIR/build-step-function-lambda.sh"
 fi
 
@@ -49,8 +59,8 @@ fi
 echo ""
 echo "Uploading artifacts..."
 
-aws s3 cp "$PROJECT_DIR/templates/gateway-asg.yaml" \
-  "s3://${BUCKET}/templates/gateway-asg.yaml" --region "$REGION"
+aws s3 cp "$SCRIPT_DIR/lambda-activation.zip" \
+  "s3://${BUCKET}/lambda-activation.zip" --region "$REGION"
 
 aws s3 cp "$SCRIPT_DIR/lambda-step-function.zip" \
   "s3://${BUCKET}/lambda-step-function.zip" --region "$REGION"
@@ -61,13 +71,12 @@ aws s3 cp "$SCRIPT_DIR/pexpect-layer.zip" \
 echo ""
 echo "=== Upload complete ==="
 echo ""
-echo "Bucket:       s3://${BUCKET}"
-echo "Template URL: https://${BUCKET}.s3.${REGION}.amazonaws.com/templates/gateway-asg.yaml"
+echo "Bucket: s3://${BUCKET}"
 echo ""
 echo "Deploy with:"
 echo "  aws cloudformation create-stack \\"
 echo "    --stack-name <name> \\"
-echo "    --template-url https://${BUCKET}.s3.${REGION}.amazonaws.com/templates/gateway-asg.yaml \\"
+echo "    --template-body file://templates/gateway-asg.yaml \\"
 echo "    --parameters \\"
 echo "      ParameterKey=NetskopeTenantUrl,ParameterValue=https://tenant.goskope.com \\"
 echo "      ParameterKey=NetskopeApiToken,ParameterValue=<token> \\"

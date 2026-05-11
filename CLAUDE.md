@@ -1,6 +1,8 @@
 # CLAUDE.md
 
-Project-level instructions for Claude Code in the AWS-AIGW-Reference-Architecture repository.
+Project instructions for Claude Code — deployment and operations.
+
+For development and template modification guidelines, see [CLAUDE_DEV.md](CLAUDE_DEV.md).
 
 ## Project Overview
 
@@ -27,77 +29,19 @@ Each gateway instance is automatically enrolled and configured through this chai
 
 Netskope API credentials never touch the gateway instances. The Activation Lambda reads from Secrets Manager and calls the Netskope API to generate an enrollment token, which exists only in Lambda memory. The token is passed directly to the instance over SSH and never persisted to any AWS storage service. The instance IAM role only needs CloudWatch Logs permissions — no access to Secrets Manager or Parameter Store.
 
-## Directory Structure
-
-```
-templates/
-  gateway-asg.yaml           # Production CloudFormation template (all resources)
-  gateway-asg-ssm.yaml       # Archived SSM-based template (pre-SSH migration)
-  test-ssh-tunnel.yaml       # SSH tunnel proof-of-concept test stack
-  test-step-function.yaml    # Step Functions enrollment test stack
-libs/tui/
-  paramiko_session.py        # Paramiko-based TUI session (Lambda-compatible)
-  tui_actions.py             # Menu navigation helpers
-  tui_screen.py              # pyte screen parsing
-  tui_session.py             # pexpect-based TUI session (local testing only)
-scripts/
-  step_function_handlers.py  # Enrollment Lambda handlers (action-routed)
-  build-tui-layer.sh         # Builds paramiko/pyte Lambda Layer
-  build-step-function-lambda.sh  # Packages enrollment Lambda
-docs/
-  DEVOPS.md                  # Operations guide — lifecycle, scaling, secrets, troubleshooting
-  CERTIFICATE_MANAGEMENT.md  # ACM certificate creation and import (Mac/Win/Linux)
-  TUI_ENROLLMENT_PLAN.md     # Implementation plan and test results
-```
-
-## Key Resources in the Template
-
-| Resource | Type | Purpose |
-|----------|------|---------|
-| `GatewayAutoScalingGroup` | AutoScaling::AutoScalingGroup | Instance management with inline lifecycle hooks |
-| `GatewayLaunchTemplate` | EC2::LaunchTemplate | Instance config (AMI, type, SG, IAM, EBS) |
-| `ApplicationLoadBalancer` | ELBv2::LoadBalancer | Internet-facing HTTPS ingress (public subnets) |
-| `ActivationLambdaFunction` | Lambda::Function | Appliance registration, starts Step Functions |
-| `EnrollmentLambdaFunction` | Lambda::Function | SSH/TUI enrollment actions (VPC-attached) |
-| `EnrollmentStateMachine` | StepFunctions::StateMachine | Orchestrates enrollment flow with polling |
-| `ParamikoLayer` | Lambda::LayerVersion | paramiko + pyte for SSH/TUI automation |
-| `SSHKeyPair` | Custom::SSHKeyPair | Generates SSH key pair for Lambda→gateway access |
-| `NetskopeSecret` | SecretsManager::Secret | Tenant URL + API token |
-| `SSHPrivateKeySecret` | SecretsManager::Secret | SSH private key for Lambda automation |
-| `LifecycleSnsTopic` | SNS::Topic | Lifecycle hook → Lambda delivery |
-
-## Template Conventions
-
-- **YAML only**, two-space indent
-- All named resources use `!Sub '${AWS::StackName}-<role>'`
-- All taggable resources have `Project` (from parameter), `Environment`, `ManagedBy: CloudFormation`
-- IAM follows least-privilege — separate statements per permission grant, no `Resource: '*'` except where required (DescribeInstances, VPC networking)
-- Sensitive values stored in Secrets Manager; gateway instances have no access to Secrets Manager or Parameter Store
-- Supports both new VPC (creates public/private subnets, IGW, NAT gateway, VPC endpoints) and existing VPC (user provides public + private subnet IDs)
-- Activation Lambda is inline (`ZipFile`) for the dispatcher; Enrollment Lambda is S3-packaged with a paramiko/pyte Layer
-- Step Functions ASL is defined inline in the template using `!Sub` for Lambda ARN interpolation — use `${Resource.Arn}` syntax, not `$.` (which is JSONPath for state machine input)
-
 ## Deployment
 
-The template exceeds 51KB and must be uploaded to S3 before deployment:
+Build Lambda artifacts and deploy:
 
 ```bash
-ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-REGION=us-west-1
-BUCKET="netskope-aigw-templates-${ACCOUNT_ID}"
+# Build and upload Lambda packages to S3
+scripts/deploy-artifacts.sh us-west-1
 
-aws s3 mb "s3://${BUCKET}" --region "${REGION}"
-aws s3 cp templates/gateway-asg.yaml "s3://${BUCKET}/templates/gateway-asg.yaml"
-
+# Deploy with a new VPC (omit Existing* parameters)
 aws cloudformation create-stack \
   --stack-name <name> \
-  --template-url "https://${BUCKET}.s3.${REGION}.amazonaws.com/templates/gateway-asg.yaml" \
+  --template-body file://templates/gateway-asg.yaml \
   --parameters \
-    ParameterKey=ExistingVpcId,ParameterValue=<vpc-id> \
-    ParameterKey=ExistingPublicSubnetId,ParameterValue=<pub-subnet-1> \
-    ParameterKey=ExistingPublicSubnet2Id,ParameterValue=<pub-subnet-2> \
-    ParameterKey=ExistingPrivateSubnetId,ParameterValue=<priv-subnet-1> \
-    ParameterKey=ExistingPrivateSubnet2Id,ParameterValue=<priv-subnet-2> \
     ParameterKey=NetskopeTenantUrl,ParameterValue=https://tenant.goskope.com \
     ParameterKey=NetskopeApiToken,ParameterValue=<token> \
     ParameterKey=AcmCertificateArn,ParameterValue=<acm-arn> \
@@ -106,18 +50,35 @@ aws cloudformation create-stack \
   --capabilities CAPABILITY_NAMED_IAM
 ```
 
+The template is under 51KB and can be deployed directly with `--template-body` — no S3 upload needed for the template itself. Only the Lambda packages and Layer need S3.
+
+See [DEPLOYMENT.md](docs/DEPLOYMENT.md) for full instructions including existing VPC deployments and artifact updates.
+
+## Operations Quick Reference
+
+| Task | Command |
+|------|---------|
+| Check instance states | `aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names <stack>-asg --query "AutoScalingGroups[0].Instances[*].[InstanceId,LifecycleState]" --output table` |
+| Check enrollment progress | `aws stepfunctions list-executions --state-machine-arn arn:aws:states:<region>:<account>:stateMachine:<stack>-enrollment --output table` |
+| Scale out | `aws autoscaling update-auto-scaling-group --auto-scaling-group-name <stack>-asg --desired-capacity <N>` |
+| View enrollment logs | `aws logs tail /aws/lambda/<stack>-enrollment --since 30m` |
+| View activation logs | `aws logs tail /aws/lambda/<stack>-activation --since 30m` |
+
 ## Rules
 
-- **Do not store API credentials on instances** — the Activation Lambda handles all Netskope API calls. The enrollment token is passed directly over SSH and never persisted.
-- **Lifecycle hooks must be inline** on the ASG (`LifecycleHookSpecificationList`), not separate resources — separate resources create a race condition where the ASG launches instances before the hooks exist.
-- **ASG must DependsOn SNS subscription and Lambda permission** — prevents the ASG from launching instances before the lifecycle event delivery chain is fully wired.
-- **Template must be uploaded to S3** before deployment (exceeds 51KB inline limit). Bucket must be in the same region as the stack. The Lambda package and Layer zip must also be in the same bucket.
-- **Do not hardcode AMI IDs or IP addresses** in documentation — these are environment-specific and passed as parameters.
+- **Lambda artifacts must be uploaded to S3** before deployment. The S3 bucket must be in the same region as the stack. The template itself is under 51KB and can be deployed directly with `--template-body`.
 - **CUDA NVIDIA GPU required** for advanced AI guardrails — standard guardrails work on CPU instances (m5.4xlarge), but advanced guardrails need GPU instances (g4dn, g5).
-- **Keep the CloudFormation skill conventions** — `Project` and `Environment` as required tag parameters, `!Ref Project` in all tags, explicit IAM policies with no `Action: '*'`, VPC endpoints when creating a new VPC.
-- **When modifying the Activation Lambda code**, keep both `handle_lifecycle_event` (ASG mode) and `handle_cfn_event` (single-instance mode) handlers — the same Lambda code is shared with the single-instance `gateway.yaml` template.
-- **The Enrollment Lambda must be in the VPC** (private subnets, both AZs) to SSH to gateway instances. It needs the Secrets Manager VPC endpoint and NAT gateway for outbound access.
-- **Build the Lambda Layer on x86_64** — use `--platform linux/amd64` with Docker/Podman when building on Apple Silicon. Lambda runs on x86_64.
+
+## Documentation
+
+| Document | Purpose |
+|----------|---------|
+| [README.md](README.md) | Prerequisites, parameters, deployment |
+| [DEPLOYMENT.md](docs/DEPLOYMENT.md) | Build artifacts, upload to S3, deploy |
+| [DEVOPS.md](docs/DEVOPS.md) | Lifecycle, scaling, secrets, VPC requirements |
+| [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Claude Code usage, AWS credentials, failure diagnosis, manual recovery |
+| [CERTIFICATE_MANAGEMENT.md](docs/CERTIFICATE_MANAGEMENT.md) | ACM certificate creation and import |
+| [CLAUDE_DEV.md](CLAUDE_DEV.md) | Template conventions, resource inventory, development rules |
 
 ## Related Resources
 

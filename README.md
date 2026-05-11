@@ -4,6 +4,8 @@
 
 This CloudFormation template (`templates/gateway-asg.yaml`) deploys the Netskope AI Gateway as an auto-scaling cluster behind an Application Load Balancer. It automates appliance enrollment, DLP configuration, and lifecycle management so that instances are fully configured before receiving traffic and cleanly deregistered on termination.
 
+This repository includes a `CLAUDE.md` file that provides [Claude Code](https://docs.anthropic.com/en/docs/claude-code) with full project context. Claude Code can assist with deploying stacks, reading logs, diagnosing enrollment failures, and managing scaling operations. See [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) for usage examples.
+
 ![Architecture Diagram](docs/architecture.png)
 
 ---
@@ -220,11 +222,17 @@ You can create a dedicated IAM role with this policy and assume it before deploy
 
 ---
 
-## Upload Templates to S3
+## Upload Lambda Artifacts to S3
 
-The CloudFormation templates exceed the 51,200-byte inline limit for `--template-body`. Upload them to an S3 bucket before deployment. The bucket must be in the same region as the stack you are deploying.
+The Lambda packages and Layer must be uploaded to an S3 bucket before deployment. The template itself is under 51KB and can be deployed directly with `--template-body`.
 
-### Create the bucket
+Use the provided script to create the bucket, build, and upload:
+
+```bash
+scripts/deploy-artifacts.sh us-west-1
+```
+
+Or manually:
 
 ```bash
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
@@ -232,12 +240,15 @@ REGION=us-west-1
 BUCKET="netskope-aigw-templates-${ACCOUNT_ID}"
 
 aws s3 mb "s3://${BUCKET}" --region "${REGION}"
-```
 
-### Upload templates
+bash scripts/build-activation-lambda.sh
+bash scripts/build-step-function-lambda.sh
+# Build Layer (requires Docker/Podman):
+podman run --rm --platform linux/amd64 --entrypoint bash \
+  -v "$PWD/scripts:/build" -w /build \
+  public.ecr.aws/lambda/python:3.12 ./build-tui-layer.sh
 
-```bash
-aws s3 cp templates/gateway-asg.yaml "s3://${BUCKET}/templates/gateway-asg.yaml"
+aws s3 cp scripts/lambda-activation.zip "s3://${BUCKET}/lambda-activation.zip"
 aws s3 cp scripts/lambda-step-function.zip "s3://${BUCKET}/lambda-step-function.zip"
 aws s3 cp scripts/pexpect-layer.zip "s3://${BUCKET}/layers/pexpect-layer.zip"
 ```
@@ -246,20 +257,13 @@ aws s3 cp scripts/pexpect-layer.zip "s3://${BUCKET}/layers/pexpect-layer.zip"
 
 ```
 s3://<bucket>/
-  templates/
-    gateway-asg.yaml          # Auto Scaling deployment (~59 KB)
-  lambda-step-function.zip    # Enrollment Lambda package
+  lambda-activation.zip       # Activation Lambda package (~4 KB)
+  lambda-step-function.zip    # Enrollment Lambda package (~20 KB)
   layers/
-    pexpect-layer.zip         # paramiko/pyte Lambda Layer
+    pexpect-layer.zip         # paramiko/pyte Lambda Layer (~10 MB)
 ```
 
-### Template URL format
-
-```
-https://<bucket>.s3.<region>.amazonaws.com/templates/gateway-asg.yaml
-```
-
-The bucket does not need to be public. CloudFormation fetches the template using the caller's IAM credentials. For same-account deployments, the `s3:GetObject` permission in the deploying role is sufficient. For cross-account deployments, additionally add a bucket policy granting `s3:GetObject` to the deploying account.
+The bucket must be in the **same region** as the stack. It does not need to be public — CloudFormation fetches using the caller's IAM credentials.
 
 ---
 
@@ -270,7 +274,7 @@ The bucket does not need to be public. CloudFormation fetches the template using
 ```bash
 aws cloudformation create-stack \
   --stack-name my-aigw \
-  --template-url "https://${BUCKET}.s3.${REGION}.amazonaws.com/templates/gateway-asg.yaml" \
+  --template-body file://templates/gateway-asg.yaml \
   --parameters \
     ParameterKey=ExistingVpcId,ParameterValue=vpc-xxxxxxxxx \
     ParameterKey=ExistingPublicSubnetId,ParameterValue=subnet-pub1 \
@@ -454,4 +458,5 @@ The DLPoD appliance must be deployed separately (it is not included in this temp
 - [DLP On Demand Documentation](https://docs.netskope.com/en/data-loss-prevention-on-demand/)
 - [DEPLOYMENT.md](docs/DEPLOYMENT.md) — Building artifacts, uploading to S3, and deploying the stack
 - [CERTIFICATE_MANAGEMENT.md](docs/CERTIFICATE_MANAGEMENT.md) — Creating and importing ACM certificates
-- [DEVOPS.md](docs/DEVOPS.md) — Operational runbook covering instance lifecycle, scaling, secrets management, and troubleshooting
+- [DEVOPS.md](docs/DEVOPS.md) — Operational runbook covering instance lifecycle, scaling, and secrets management
+- [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) — Using Claude Code, AWS credentials, diagnosing enrollment failures, and manual recovery

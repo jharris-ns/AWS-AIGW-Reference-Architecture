@@ -31,7 +31,7 @@ Then deploy the stack:
 ```bash
 aws cloudformation create-stack \
   --stack-name my-aigw \
-  --template-url <template-url-from-script-output> \
+  --template-body file://templates/gateway-asg.yaml \
   --parameters \
     ParameterKey=NetskopeTenantUrl,ParameterValue=https://tenant.goskope.com \
     ParameterKey=NetskopeApiToken,ParameterValue=<token> \
@@ -85,17 +85,18 @@ This produces `scripts/lambda-step-function.zip` (~20 KB) containing the Step Fu
 ### 4. Upload to S3
 
 ```bash
-aws s3 cp templates/gateway-asg.yaml "s3://${BUCKET}/templates/gateway-asg.yaml" --region "${REGION}"
+aws s3 cp scripts/lambda-activation.zip "s3://${BUCKET}/lambda-activation.zip" --region "${REGION}"
 aws s3 cp scripts/lambda-step-function.zip "s3://${BUCKET}/lambda-step-function.zip" --region "${REGION}"
 aws s3 cp scripts/pexpect-layer.zip "s3://${BUCKET}/layers/pexpect-layer.zip" --region "${REGION}"
 ```
+
+The template itself is under 51KB and can be deployed directly with `--template-body` — no S3 upload needed for the template.
 
 ### S3 bucket layout
 
 ```
 s3://<bucket>/
-  templates/
-    gateway-asg.yaml            # CloudFormation template (~59 KB)
+  lambda-activation.zip         # Activation Lambda package (~4 KB)
   lambda-step-function.zip      # Enrollment Lambda package (~20 KB)
   layers/
     pexpect-layer.zip           # paramiko/pyte Lambda Layer (~10 MB)

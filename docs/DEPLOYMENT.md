@@ -16,7 +16,7 @@ This guide covers building and uploading the deployment artifacts, and deploying
 
 ## Quick Start
 
-The `deploy-artifacts.sh` script handles everything — creates the S3 bucket, builds the Lambda artifacts, and uploads them:
+The `deploy-artifacts.sh` script handles everything — creates the S3 bucket, builds all three Lambda packages + Layer + template, and uploads them:
 
 ```bash
 # Default region (us-west-1)
@@ -26,18 +26,35 @@ scripts/deploy-artifacts.sh
 scripts/deploy-artifacts.sh us-east-1
 ```
 
-Then deploy the stack:
+Then deploy the stack. The template exceeds 51KB and must be deployed via S3 using `--template-url`:
 
 ```bash
 aws cloudformation create-stack \
   --stack-name my-aigw \
-  --template-body file://templates/gateway-asg.yaml \
+  --template-url https://<bucket>.s3.<region>.amazonaws.com/templates/gateway-asg.yaml \
   --parameters \
     ParameterKey=NetskopeTenantUrl,ParameterValue=https://tenant.goskope.com \
     ParameterKey=NetskopeApiToken,ParameterValue=<token> \
-    ParameterKey=AcmCertificateArn,ParameterValue=<acm-arn> \
     ParameterKey=GatewayAmiId,ParameterValue=<ami-id> \
     ParameterKey=LambdaCodeBucket,ParameterValue=<bucket-from-script-output> \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --region <region>
+```
+
+To deploy with DLPoD (DLP on Demand), add the following parameters:
+
+```bash
+aws cloudformation create-stack \
+  --stack-name my-aigw \
+  --template-url https://<bucket>.s3.<region>.amazonaws.com/templates/gateway-asg.yaml \
+  --parameters \
+    ParameterKey=NetskopeTenantUrl,ParameterValue=https://tenant.goskope.com \
+    ParameterKey=NetskopeApiToken,ParameterValue=<token> \
+    ParameterKey=GatewayAmiId,ParameterValue=<ami-id> \
+    ParameterKey=LambdaCodeBucket,ParameterValue=<bucket-from-script-output> \
+    ParameterKey=DlpodAmiId,ParameterValue=<dlpod-ami> \
+    ParameterKey=DlpodLicenseKey,ParameterValue=<license-key> \
+    ParameterKey=DnsServer,ParameterValue=<vpc-dns-ip> \
   --capabilities CAPABILITY_NAMED_IAM \
   --region <region>
 ```
@@ -74,23 +91,28 @@ This produces `scripts/pexpect-layer.zip` (~10 MB).
 
 **Note:** On Apple Silicon (M1/M2/M3), the `--platform linux/amd64` flag is required. Without it, the Layer will contain ARM binaries that fail in Lambda.
 
-### 3. Build the Lambda package
+### 3. Build the Lambda packages
 
 ```bash
 bash scripts/build-step-function-lambda.sh
+bash scripts/build-dlpod-lambda.sh
 ```
 
-This produces `scripts/lambda-step-function.zip` (~20 KB) containing the Step Functions handler code and the TUI automation libraries.
+This produces:
+- `scripts/lambda-step-function.zip` (~20 KB) — Step Functions handler code and TUI automation libraries
+- `scripts/lambda-dlpod.zip` — DLPoD CLI automation Lambda
 
 ### 4. Upload to S3
 
 ```bash
 aws s3 cp scripts/lambda-activation.zip "s3://${BUCKET}/lambda-activation.zip" --region "${REGION}"
 aws s3 cp scripts/lambda-step-function.zip "s3://${BUCKET}/lambda-step-function.zip" --region "${REGION}"
+aws s3 cp scripts/lambda-dlpod.zip "s3://${BUCKET}/lambda-dlpod.zip" --region "${REGION}"
 aws s3 cp scripts/pexpect-layer.zip "s3://${BUCKET}/layers/pexpect-layer.zip" --region "${REGION}"
+aws s3 cp templates/gateway-asg.yaml "s3://${BUCKET}/templates/gateway-asg.yaml" --region "${REGION}"
 ```
 
-The template itself is under 51KB and can be deployed directly with `--template-body` — no S3 upload needed for the template.
+The template exceeds 51KB and must be uploaded to S3 and deployed using `--template-url`.
 
 ### S3 bucket layout
 
@@ -98,8 +120,11 @@ The template itself is under 51KB and can be deployed directly with `--template-
 s3://<bucket>/
   lambda-activation.zip         # Activation Lambda package (~4 KB)
   lambda-step-function.zip      # Enrollment Lambda package (~20 KB)
+  lambda-dlpod.zip              # DLPoD CLI automation Lambda
   layers/
     pexpect-layer.zip           # paramiko/pyte Lambda Layer (~10 MB)
+  templates/
+    gateway-asg.yaml            # CloudFormation template (>51 KB)
 ```
 
 ### 5. Deploy the stack
@@ -109,6 +134,18 @@ See the [README](../README.md#deployment) for deployment commands (new VPC or ex
 ---
 
 ## Updating an Existing Deployment
+
+To update the CloudFormation template, re-upload it to S3 first:
+
+```bash
+aws s3 cp templates/gateway-asg.yaml "s3://${BUCKET}/templates/gateway-asg.yaml" --region "${REGION}"
+
+aws cloudformation update-stack \
+  --stack-name <stack-name> \
+  --template-url https://${BUCKET}.s3.${REGION}.amazonaws.com/templates/gateway-asg.yaml \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --region "${REGION}"
+```
 
 To update the Lambda code without replacing the stack:
 

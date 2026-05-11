@@ -21,12 +21,13 @@ class ParamikoConfig:
     """Configuration for paramiko-based TUI session."""
 
     def __init__(self, host, username='nsadmin', password=None,
-                 private_key_pem=None, port=22, **kwargs):
+                 private_key_pem=None, port=22, mode='tui', **kwargs):
         self.SSH_HOST = host
         self.SSH_PORT = port
         self.SSH_USER = username
         self.SSH_PASSWORD = password
         self.PRIVATE_KEY_PEM = private_key_pem
+        self.MODE = mode  # 'tui' for AI Gateway TUI, 'cli' for DLPoD CLI shell
 
         self.TERMINAL_ROWS = kwargs.get('terminal_rows', 40)
         self.TERMINAL_COLS = kwargs.get('terminal_cols', 120)
@@ -221,6 +222,28 @@ class ParamikoTUISession:
             logger.debug('Screen after auth (%d chars): %s',
                          len(screen_text), screen_text[:200])
 
+            if self.config.MODE == 'cli':
+                # CLI mode for DLPoD — wait for nsappliance> prompt
+                cli_patterns = [r'nsappliance[>(]', r'[>#]\s*$']
+                is_cli = any(re.search(p, screen_text, re.MULTILINE)
+                             for p in cli_patterns)
+                if not is_cli:
+                    logger.info('CLI prompt not detected yet, waiting...')
+                    time.sleep(self.config.SCREEN_LOAD_DELAY)
+                    self.child._drain(timeout=5.0)
+                    screen_text = self.get_screen_text()
+                    is_cli = any(re.search(p, screen_text, re.MULTILINE)
+                                 for p in cli_patterns)
+                if is_cli:
+                    logger.info('CLI prompt detected')
+                else:
+                    logger.warning('CLI prompt not detected, proceeding anyway. '
+                                   'Screen: %s', screen_text[:200])
+                self._connected = True
+                logger.info('CLI session ready')
+                return True
+
+            # TUI mode (default) — detect TUI or launch aig-cli
             tui_patterns = [
                 r'Enroll this AI Gateway',
                 r'Configuration Wizard',

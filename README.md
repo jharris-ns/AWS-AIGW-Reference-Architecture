@@ -47,13 +47,11 @@ For more information, see:
 - [Administrators RBAC V3](https://docs.netskope.com/en/administrators-rbac-v3/)
 - [Service Account Migration](https://docs.netskope.com/en/service-account-migration-and-netskope-client-auditing/)
 
-### 3. ACM Certificate
+### 3. TLS Certificates (Automatic)
 
-An AWS Certificate Manager (ACM) certificate is required for the ALB HTTPS listener. You can:
-- Request a public certificate through ACM (requires DNS or email validation).
-- Import an existing certificate (including self-signed for testing).
+TLS certificates for both the gateway ALB and DLPoD ALB are automatically generated at stack creation by a shared cert generator Lambda. The gateway ALB certificate uses the `GatewayAlbDomainName` parameter as the Common Name (default: `aigw.internal`). No manual certificate creation is required. See [CERTIFICATE_MANAGEMENT.md](docs/CERTIFICATE_MANAGEMENT.md) for details.
 
-Note the certificate ARN — it is a required stack parameter. See [CERTIFICATE_MANAGEMENT.md](docs/CERTIFICATE_MANAGEMENT.md) for step-by-step instructions on creating and importing certificates (macOS, Linux, and Windows).
+See [CERTIFICATE_MANAGEMENT.md](docs/CERTIFICATE_MANAGEMENT.md) for step-by-step instructions on creating and importing certificates (macOS, Linux, and Windows).
 
 ### 4. Lambda Deployment Artifacts
 
@@ -65,9 +63,13 @@ scripts/deploy-artifacts.sh us-west-1
 
 See [DEPLOYMENT.md](docs/DEPLOYMENT.md) for manual steps and update procedures.
 
-### 5. DLPoD Appliance (Optional)
+### 5. DLPoD (Optional)
 
-If you want DLP content inspection, deploy a Netskope DLP On Demand appliance separately. It must be reachable from the AI Gateway instances over HTTPS (port 443). If the DLPoD is in a different VPC, you need VPC peering or Transit Gateway connectivity. Pass the DLPoD's URL as the `DlpHostUrl` parameter.
+If you want DLP content inspection, provide a DLPoD AMI ID (`DlpodAmiId`) and license key (`DlpodLicenseKey`) when deploying. The template conditionally deploys DLPoD as part of the stack — no separate deployment is needed.
+
+To obtain these:
+- **DLPoD AMI** — Contact your Netskope representative to have the DLPoD AMI shared with your AWS account, or copy it from the source account using `aws ec2 copy-image`.
+- **License Key** — In your Netskope tenant, navigate to **Settings > Security Cloud Platform > On-Premises Infrastructure** to generate or retrieve a DLPoD license key.
 
 ### 6. AWS Services and IAM Permissions
 
@@ -78,10 +80,11 @@ The template creates resources across the following AWS services:
 | **EC2** | Launch Template, Security Groups, VPC (optional), Subnets (optional), VPC Endpoints (optional) |
 | **Auto Scaling** | Auto Scaling Group, Lifecycle Hooks |
 | **Elastic Load Balancing** | Application Load Balancer, Target Group, HTTPS Listener |
-| **Lambda** | 2 Functions (activation + enrollment), Layer, Permission |
-| **Step Functions** | State Machine (enrollment orchestration) |
-| **IAM** | 5 Roles (gateway, activation Lambda, enrollment Lambda, Step Functions, lifecycle SNS), Instance Profile |
+| **Lambda** | 3-4 Functions (activation, enrollment, cert generator, DLPoD tethering when enabled), Layer, Permissions |
+| **Step Functions** | 1-2 State Machines (enrollment orchestration, DLPoD tethering when enabled) |
+| **IAM** | Roles (gateway, activation Lambda, enrollment Lambda, Step Functions, lifecycle SNS, cert generator, DLPoD when enabled), Instance Profiles |
 | **Secrets Manager** | 2 Secrets (Netskope credentials, SSH private key) |
+| **Route 53** | Private hosted zone for DLPoD ALB (when DLPoD enabled) |
 | **SNS** | Topic, Subscription |
 | **CloudWatch Logs** | Log Group (Lambda) |
 
@@ -224,7 +227,7 @@ You can create a dedicated IAM role with this policy and assume it before deploy
 
 ## Upload Lambda Artifacts to S3
 
-The Lambda packages and Layer must be uploaded to an S3 bucket before deployment. The template itself is under 51KB and can be deployed directly with `--template-body`.
+The Lambda packages, Layer, and template must be uploaded to an S3 bucket before deployment. The template exceeds 51KB and must be deployed via `--template-url` from S3.
 
 Use the provided script to create the bucket, build, and upload:
 
@@ -248,6 +251,7 @@ podman run --rm --platform linux/amd64 --entrypoint bash \
   -v "$PWD/scripts:/build" -w /build \
   public.ecr.aws/lambda/python:3.12 ./build-tui-layer.sh
 
+aws s3 cp templates/gateway-asg.yaml "s3://${BUCKET}/templates/gateway-asg.yaml"
 aws s3 cp scripts/lambda-activation.zip "s3://${BUCKET}/lambda-activation.zip"
 aws s3 cp scripts/lambda-step-function.zip "s3://${BUCKET}/lambda-step-function.zip"
 aws s3 cp scripts/pexpect-layer.zip "s3://${BUCKET}/layers/pexpect-layer.zip"
@@ -257,6 +261,8 @@ aws s3 cp scripts/pexpect-layer.zip "s3://${BUCKET}/layers/pexpect-layer.zip"
 
 ```
 s3://<bucket>/
+  templates/
+    gateway-asg.yaml          # CloudFormation template (>51 KB)
   lambda-activation.zip       # Activation Lambda package (~4 KB)
   lambda-step-function.zip    # Enrollment Lambda package (~20 KB)
   layers/
@@ -274,7 +280,7 @@ The bucket must be in the **same region** as the stack. It does not need to be p
 ```bash
 aws cloudformation create-stack \
   --stack-name my-aigw \
-  --template-body file://templates/gateway-asg.yaml \
+  --template-url "https://${BUCKET}.s3.${REGION}.amazonaws.com/templates/gateway-asg.yaml" \
   --parameters \
     ParameterKey=ExistingVpcId,ParameterValue=vpc-xxxxxxxxx \
     ParameterKey=ExistingPublicSubnetId,ParameterValue=subnet-pub1 \
@@ -283,13 +289,29 @@ aws cloudformation create-stack \
     ParameterKey=ExistingPrivateSubnet2Id,ParameterValue=subnet-priv2 \
     ParameterKey=NetskopeTenantUrl,ParameterValue=https://tenant.goskope.com \
     ParameterKey=NetskopeApiToken,ParameterValue=<token> \
-    ParameterKey=AcmCertificateArn,ParameterValue=arn:aws:acm:<region>:<account>:certificate/<id> \
-    ParameterKey=DlpHostUrl,ParameterValue=https://dlpod.internal \
     ParameterKey=LambdaCodeBucket,ParameterValue=${BUCKET} \
   --capabilities CAPABILITY_NAMED_IAM
 ```
 
 When using an existing VPC, review the [VPC Requirements](#vpc-requirements-existing-vpc) section to ensure your network is correctly configured.
+
+### Deploy with DLPoD
+
+To include DLP content inspection, add the DLPoD parameters:
+
+```bash
+aws cloudformation create-stack \
+  --stack-name my-aigw \
+  --template-url "https://${BUCKET}.s3.${REGION}.amazonaws.com/templates/gateway-asg.yaml" \
+  --parameters \
+    ParameterKey=NetskopeTenantUrl,ParameterValue=https://tenant.goskope.com \
+    ParameterKey=NetskopeApiToken,ParameterValue=<token> \
+    ParameterKey=GatewayAmiId,ParameterValue=<gateway-ami-id> \
+    ParameterKey=DlpodAmiId,ParameterValue=<dlpod-ami-id> \
+    ParameterKey=DlpodLicenseKey,ParameterValue=<license-key> \
+    ParameterKey=LambdaCodeBucket,ParameterValue=${BUCKET} \
+  --capabilities CAPABILITY_NAMED_IAM
+```
 
 ### Deploy with a new VPC
 
@@ -318,7 +340,6 @@ After deployment, the stack provides these outputs:
 |-----------|----------|-------------|
 | `NetskopeTenantUrl` | Yes | Netskope tenant URL (e.g., `https://tenant.goskope.com`). Do not include the API path. |
 | `NetskopeApiToken` | Yes | API token for appliance registration. Stored in Secrets Manager (NoEcho). |
-| `DlpHostUrl` | No | DLPoD HTTPS endpoint. Leave empty to skip DLP configuration. |
 
 ### Network Configuration
 
@@ -357,7 +378,7 @@ The template uses a split-subnet architecture: **public subnets** for the ALB an
 
 | Parameter | Required | Description |
 |-----------|----------|-------------|
-| `AcmCertificateArn` | Yes | ACM certificate ARN for the ALB HTTPS listener. |
+| `GatewayAlbDomainName` | No | Common Name for the auto-generated gateway ALB certificate (default: `aigw.internal`). |
 
 ### Auto Scaling Configuration
 
@@ -366,6 +387,22 @@ The template uses a split-subnet architecture: **public subnets** for the ALB an
 | `MinCapacity` | No | Minimum number of gateway instances. |
 | `MaxCapacity` | No | Maximum number of gateway instances. |
 | `DesiredCapacity` | No | Initial number of gateway instances. |
+
+### DLPoD Configuration
+
+All DLPoD parameters are optional. Leave `DlpodAmiId` empty to skip DLPoD deployment entirely.
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `DlpodAmiId` | No | DLPoD AMI ID. Leave empty to skip DLPoD deployment. |
+| `DlpodInstanceType` | No | DLPoD instance type (default: `c5a.4xlarge`). Must be c5a or c5ad family. |
+| `DlpodLicenseKey` | No | DLPoD license key from Netskope tenant (NoEcho). Required when `DlpodAmiId` is provided. |
+| `DlpodLambdaCodeKey` | No | S3 key for DLPoD Lambda package (default: `lambda-dlpod.zip`). |
+| `DlpDomainName` | No | FQDN for the DLPoD private ALB (default: `dlp.aigw.internal`). Resolved via Route 53 private hosted zone. |
+| `DnsServer` | No | DNS server IP for DLPoD configuration. Leave empty if not required. |
+| `DlpodMinCapacity` | No | Minimum number of DLPoD instances (default: `1`). |
+| `DlpodMaxCapacity` | No | Maximum number of DLPoD instances (default: `1`). |
+| `DlpodDesiredCapacity` | No | Desired number of DLPoD instances (default: `1`). |
 
 ### Tagging
 
@@ -416,12 +453,7 @@ The template creates a Secrets Manager VPC endpoint in all deployments. An S3 ga
 
 ### DLPoD Network Connectivity
 
-If using DLP (`DlpHostUrl` is set), the AI Gateway instances must be able to reach the DLPoD appliance on HTTPS (port 443). If the DLPoD is:
-
-- **In the same VPC and subnet** — No additional configuration needed.
-- **In a different subnet in the same VPC** — Ensure route table entries and security groups allow traffic.
-- **In a different VPC** — VPC peering or Transit Gateway is required, along with route table entries in both VPCs and security group rules on the DLPoD allowing inbound 443 from the gateway VPC CIDR.
-- **On a public IP** — The gateway instances need outbound internet access. Note that the DLPoD's TLS certificate CN/SAN must match the hostname or IP used in `DlpHostUrl`, or the AI Gateway's TLS verification will reject the connection.
+When DLPoD is deployed (`DlpodAmiId` is provided), it runs in the same VPC and private subnets as the AI Gateway instances. A private ALB fronts the DLPoD ASG, and a Route 53 private hosted zone resolves `DlpDomainName` (default: `dlp.aigw.internal`) to the private ALB. No additional VPC peering or network configuration is needed — the template handles all security group rules, ALB configuration, and DNS resolution.
 
 ---
 
@@ -442,11 +474,16 @@ Applications send requests to the AI Gateway instead of directly to the LLM prov
 
 ### How DLP On Demand (DLPoD) Integrates
 
-The AI Gateway can optionally integrate with a **Netskope DLP On Demand (DLPoD)** appliance for deep content inspection. DLPoD is a separate appliance that provides local, collocated document and text scanning via a REST API. It supports both structured and unstructured content analysis, including text extracted from LLM prompts and responses.
+The AI Gateway can optionally integrate with a **Netskope DLP On Demand (DLPoD)** appliance for deep content inspection. DLPoD provides local, collocated document and text scanning via a REST API, supporting both structured and unstructured content analysis including text extracted from LLM prompts and responses. Data does not leave your VPC for DLP scanning.
 
-When configured, the AI Gateway forwards prompt and response content to the DLPoD appliance for DLP policy evaluation before allowing the traffic to proceed. This keeps sensitive content inspection local to your environment — data does not leave your VPC for DLP scanning.
+When `DlpodAmiId` is provided, the template conditionally deploys DLPoD as part of the stack. DLPoD runs in its own Auto Scaling Group behind a private ALB, with a Route 53 private hosted zone (`dlp.aigw.internal` by default) for DNS resolution. Each DLPoD instance is automatically tethered to the Netskope management plane using the same lifecycle hook pattern as the AI Gateway:
 
-The DLPoD appliance must be deployed separately (it is not included in this template) and must be network-reachable from the AI Gateway instances. The `DlpHostUrl` parameter points the gateway to the DLPoD's HTTPS endpoint.
+1. **DLPoD ASG launches instance** -- lifecycle hook holds it in `Pending:Wait`
+2. **Activation Lambda** receives the lifecycle event and starts a DLPoD tethering Step Functions execution
+3. **Step Functions** orchestrates tethering via the DLPoD Lambda: sets the admin password, configures DNS, applies the license key, and polls until tethering completes
+4. Instance moves to `InService`
+
+The AI Gateway is automatically configured to use the DLPoD service after its own enrollment completes. The AIG enrollment state machine waits for the DLPoD TLS certificate to appear in SSM Parameter Store, then navigates the AIG TUI to configure the DLP service certificate and host URL (`DlpDomainName`).
 
 ---
 

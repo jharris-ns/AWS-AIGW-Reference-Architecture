@@ -7,16 +7,20 @@ Development instructions for Claude Code when modifying code or templates in thi
 ```
 templates/
   gateway-asg.yaml           # Production CloudFormation template (all resources)
+  test-dlpod.yaml            # DLPoD standalone test template
 libs/tui/
   paramiko_session.py        # Paramiko-based TUI session (Lambda-compatible)
+  cli_session.py             # DLPoD CLI session helpers
   tui_actions.py             # Menu navigation helpers
   tui_screen.py              # pyte screen parsing
   tui_session.py             # pexpect-based TUI session (local testing only)
 scripts/
   step_function_handlers.py  # Enrollment Lambda handlers (action-routed)
+  dlpod_handlers.py          # DLPoD tethering Lambda handler
   deploy-artifacts.sh        # Build and upload all deployment artifacts
   build-tui-layer.sh         # Builds paramiko/pyte Lambda Layer
   build-step-function-lambda.sh  # Packages enrollment Lambda
+  build-dlpod-lambda.sh      # DLPoD Lambda build script
 docs/
   DEPLOYMENT.md              # Build artifacts, upload to S3, deploy the stack
   DEVOPS.md                  # Operations guide — lifecycle, scaling, secrets
@@ -50,6 +54,15 @@ docs/
 | `NetskopeSecret` | SecretsManager::Secret | Tenant URL + API token |
 | `SSHPrivateKeySecret` | SecretsManager::Secret | SSH private key for Lambda automation |
 | `LifecycleSnsTopic` | SNS::Topic | Lifecycle hook → Lambda delivery |
+| `DlpodAutoScalingGroup` | AutoScaling::AutoScalingGroup | DLPoD instance management with lifecycle hooks |
+| `DlpodLaunchTemplate` | EC2::LaunchTemplate | DLPoD instance config |
+| `DlpodAlb` | ELBv2::LoadBalancer | Private ALB for DLPoD traffic |
+| `DlpodTargetGroup` | ELBv2::TargetGroup | DLPoD ALB target group |
+| `DlpodTetheringStateMachine` | StepFunctions::StateMachine | Orchestrates DLPoD tethering flow |
+| `DlpodTetheringLambda` | Lambda::Function | DLPoD tethering actions (VPC-attached) |
+| `DlpodActivationLambda` | Lambda::Function | DLPoD registration, starts tethering |
+| `CertGeneratorLambda` | Lambda::Function | Generates certificates (shared) |
+| `PrivateHostedZone` | Route53::HostedZone | Private DNS for internal resolution |
 
 ## Development Rules
 
@@ -61,3 +74,8 @@ docs/
 - **Keep the CloudFormation skill conventions** — `Project` and `Environment` as required tag parameters, `!Ref Project` in all tags, explicit IAM policies with no `Action: '*'`, VPC endpoints when creating a new VPC.
 - **Do not hardcode AMI IDs or IP addresses** in documentation — these are environment-specific and passed as parameters.
 - **Do not store API credentials on instances** — the Activation Lambda handles all Netskope API calls. The enrollment token is passed directly over SSH and never persisted.
+- **`ParamikoTUISession` supports `mode='cli'`** for DLPoD CLI automation — this bypasses TUI menu navigation and operates in direct command mode.
+- **TUI cert paste requires bracket paste mode** — wrap certificate content with `\x1b[200~` and `\x1b[201~` escape sequences.
+- **Cert must have `CA:TRUE` basicConstraints** for the AIG DLP service to accept it.
+- **DLPoD resources are conditional** on the `DeployDlpod` condition — all DLPoD resources in the template are gated by this condition.
+- **Sensitive fields are redacted in Lambda logs** — `password`, `enrollment_token`, and `license_key` values are masked before logging.

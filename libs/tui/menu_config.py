@@ -42,5 +42,25 @@ MENU_ITEMS = {
         'patterns': ['Network Configuration'],
         'screen_indicators': ['network interfaces', 'network interface', 'select network', 'mac address', 'dhcp'],
         'description': 'Network Configuration',
-    }
+    },
+    'dlp_service': {
+        'patterns': ['Data Loss Prevention Service', 'DLP Service'],
+        'screen_indicators': ['dlp', 'data loss', 'prevention'],
+        'description': 'DLP Service Configuration',
+    },
+    'dlp_cert': {
+        'patterns': ['Configure DLP Service Certificate'],
+        'screen_indicators': ['certificate', 'cert', 'new certificate'],
+        'description': 'DLP Service Certificate Configuration',
+    },
+    'dlp_host': {
+        'patterns': ['Configure DLP Service Host'],
+        'screen_indicators': ['host', 'host url', 'new host'],
+        'description': 'DLP Service Host Configuration',
+    },
+    'dlp_delete_host': {
+        'patterns': ['Delete DLP Service Host Configuration'],
+        'screen_indicators': ['delete', 'remove', 'host configuration'],
+        'description': 'Delete DLP Service Host Configuration',
+    },
 }

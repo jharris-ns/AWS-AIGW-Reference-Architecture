@@ -35,6 +35,16 @@ Each gateway instance is a Netskope AI Gateway appliance that must be individual
 | Lambda Layer | `ParamikoLayer` | paramiko + pyte for SSH/TUI automation |
 | SSH Key Pair | `SSHKeyPair` (Custom Resource) | Generates key pair for Lambda→gateway SSH access |
 | Secrets Manager | `NetskopeSecret`, `SSHPrivateKeySecret` | Tenant credentials and SSH private key |
+| Cert Generator Lambda | `CertGeneratorFunction` (`${StackName}-certgen`) | Creates self-signed certificates for both ALBs |
+| **DLPoD Resources** | *(conditional on `DlpodAmiId` being non-empty)* | |
+| DLPoD ASG | `DlpodAutoScalingGroup` (`${StackName}-dlpod-asg`) | Auto Scaling Group for DLPoD instances |
+| DLPoD Launch Template | `DlpodLaunchTemplate` (`${StackName}-dlpod-lt`) | Instance configuration for DLPoD appliances |
+| DLPoD Private ALB | `DlpodLoadBalancer` (`${StackName}-dlpod`) | Internal ALB for DLP service |
+| DLPoD Target Group | `DlpodTargetGroup` (`${StackName}-dlpod-tg`) | Target group for DLPoD instances |
+| DLPoD Route 53 Hosted Zone | `DlpodHostedZone` (`aigw.internal`) | Private hosted zone for DLPoD DNS resolution |
+| DLPoD Tethering Lambda | `DlpodTetheringFunction` (`${StackName}-dlpod`) | SSH/TUI tethering actions for DLPoD instances |
+| DLPoD Tethering State Machine | `DlpodTetheringStateMachine` (`${StackName}-dlpod-tethering`) | Orchestrates DLPoD tethering lifecycle |
+| DLPoD Activation Lambda | `DlpodActivationFunction` (`${StackName}-dlpod-activation`) | Handles DLPoD lifecycle events, starts tethering |
 
 ---
 
@@ -112,6 +122,49 @@ Instance terminated
 ```
 
 **Total time:** ~5 seconds. The `DefaultResult: CONTINUE` with a 300s timeout means the instance will be terminated even if the Lambda fails.
+
+### DLPoD Lifecycle Flow
+
+When `DlpodAmiId` is provided, the stack deploys a separate DLPoD Auto Scaling Group with its own lifecycle automation. The flow mirrors the gateway lifecycle but uses DLPoD-specific steps.
+
+#### DLPoD Launch Flow
+
+```
+ASG launches DLPoD instance
+        |
+        v
+Lifecycle hook: Pending:Wait
+        |
+        v
+SNS delivers EC2_INSTANCE_LAUNCHING event
+        |
+        v
+DLPoD Activation Lambda invoked
+  1. Generates password for the DLPoD instance
+  2. Starts DLPoD Tethering Step Functions execution
+        |
+        v
+Tethering State Machine runs
+  WaitForSSH          → SSH connect test (retry until ready)
+  ChangePassword      → Sets the generated password on the instance
+  SetDNS              → Configures DNS server on the DLPoD appliance
+  SetLicense          → Applies the DLPoD license key
+  PollTethering       → Polls until tethering to the Netskope tenant completes
+  CompleteLifecycle   → Calls CompleteLifecycleAction with CONTINUE
+        |
+        v
+Instance moves to InService
+        |
+        v
+DLPoD ALB health check passes
+        |
+        v
+Instance receives DLP inspection traffic from gateway instances
+```
+
+#### DLPoD Terminate Flow
+
+On termination, the lifecycle hook completes with `CONTINUE`. DLPoD instances are stateless, so no deregistration is needed.
 
 ---
 
@@ -240,6 +293,9 @@ The SSM agent is not installed on gateway instances. Interactive access requires
 | Activation Lambda | CloudWatch: `/aws/lambda/{stack}-activation` | Appliance registration, Step Functions start, deregistration |
 | Enrollment Lambda | CloudWatch: `/aws/lambda/{stack}-enrollment` | SSH connection, TUI screen captures, token submission |
 | Step Functions | Step Functions console > Executions | Per-step status, timing, input/output, errors |
+| DLPoD Activation Lambda | CloudWatch: `/aws/lambda/{stack}-dlpod-activation` | DLPoD lifecycle events, tethering state machine start |
+| DLPoD Tethering Lambda | CloudWatch: `/aws/lambda/{stack}-dlpod` | SSH connection, password change, DNS/license config, tethering status |
+| DLPoD Tethering SFN | Step Functions console > Executions | Per-step status for DLPoD tethering workflow |
 | ASG activity | ASG console > Activity tab | Launch/terminate events, lifecycle hook timeouts |
 
 ### Common Failure Scenarios
@@ -307,6 +363,34 @@ aws logs tail /aws/lambda/<stack>-enrollment --since 30m
 aws stepfunctions start-execution \
   --state-machine-arn arn:aws:states:<region>:<account>:stateMachine:<stack>-enrollment \
   --input '{"instance_ip":"<ip>","appliance_id":"<id>","enrollment_token":"<token>"}'
+
+# --- DLPoD Operations ---
+
+# Check DLPoD ASG instance states
+aws autoscaling describe-auto-scaling-groups \
+  --auto-scaling-group-names <stack>-dlpod-asg \
+  --query "AutoScalingGroups[0].Instances[*].{Id:InstanceId,State:LifecycleState,AZ:AvailabilityZone}" \
+  --output table
+
+# Check DLPoD tethering executions
+aws stepfunctions list-executions \
+  --state-machine-arn arn:aws:states:<region>:<account>:stateMachine:<stack>-dlpod-tethering \
+  --query "executions[*].{Name:name,Status:status,Start:startDate}" \
+  --output table
+
+# Scale DLPoD
+aws autoscaling update-auto-scaling-group \
+  --auto-scaling-group-name <stack>-dlpod-asg \
+  --desired-capacity <N>
+
+# Check DLPoD ALB target health
+aws elbv2 describe-target-health \
+  --target-group-arn <dlpod-tg-arn> \
+  --query "TargetHealthDescriptions[*].{Id:Target.Id,Health:TargetHealth.State}" \
+  --output table
+
+# View DLPoD tethering Lambda logs
+aws logs tail /aws/lambda/<stack>-dlpod --since 30m
 ```
 
 ---
@@ -369,6 +453,12 @@ aws ec2 describe-vpc-endpoints --filters "Name=vpc-id,Values=<vpc-id>" \
   --query "VpcEndpoints[*].[VpcEndpointId,State]" --output text
 ```
 
+#### DLPoD subnet requirements
+
+When `DlpodAmiId` is provided, the DLPoD ALB is deployed with an internal scheme in the public subnets (each public subnet must have at least 8 available IPs for the ALB ENIs). DLPoD instances run in the same private subnets as the gateway ASG.
+
+DNS on each DLPoD instance is configured to use the VPC DNS resolver, which is the VPC CIDR base address + 2 (e.g., for a `10.0.0.0/16` VPC, the DNS server is `10.0.0.2`). This is the standard AWS-provided DNS server for VPCs.
+
 ### When creating a new VPC
 
 The template automatically creates the VPC with:
@@ -386,8 +476,7 @@ The template automatically creates the VPC with:
 |-----------|----------|---------|-------------|
 | `NetskopeTenantUrl` | Yes | - | Netskope tenant URL (e.g., `https://tenant.goskope.com`) |
 | `NetskopeApiToken` | Yes | - | API token (NoEcho, stored in Secrets Manager) |
-| `DlpHostUrl` | No | '' | DLP host URL; empty skips DLP configuration |
-| `AcmCertificateArn` | Yes | - | ACM certificate ARN for ALB HTTPS listener |
+| `GatewayAlbDomainName` | No | `aigw.internal` | CN for auto-generated gateway ALB certificate |
 | `ExistingVpcId` | No | '' | Existing VPC ID; empty creates a new VPC |
 | `ExistingSubnetId` | No | '' | Existing subnet ID (AZ 1); empty creates new |
 | `ExistingSubnet2Id` | No | '' | Existing subnet ID (AZ 2); empty creates new |
@@ -402,6 +491,16 @@ The template automatically creates the VPC with:
 | `MinCapacity` | No | 1 | ASG minimum instances |
 | `MaxCapacity` | No | 3 | ASG maximum instances |
 | `DesiredCapacity` | No | 1 | ASG desired instances |
+| `GatewayAlbDomainName` | No | '' | Custom domain name for the gateway ALB |
+| `DlpodAmiId` | No | '' | DLPoD AMI ID; empty disables all DLPoD resources |
+| `DlpodInstanceType` | No | m5.4xlarge | Instance type for DLPoD instances |
+| `DlpodLicenseKey` | No | '' | License key for DLPoD appliances |
+| `DlpodLambdaCodeKey` | No | lambda-dlpod.zip | S3 key for DLPoD tethering Lambda package |
+| `DlpDomainName` | No | '' | Domain name for DLP service |
+| `DnsServer` | No | '' | DNS server IP for DLPoD instances |
+| `DlpodMinCapacity` | No | 1 | DLPoD ASG minimum instances |
+| `DlpodMaxCapacity` | No | 3 | DLPoD ASG maximum instances |
+| `DlpodDesiredCapacity` | No | 1 | DLPoD ASG desired instances |
 | `Project` | No | netskope-ai-gateway | Project tag value |
 | `Environment` | No | dev | Environment tag value |
 

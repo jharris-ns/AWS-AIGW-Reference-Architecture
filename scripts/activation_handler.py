@@ -123,6 +123,10 @@ def start_enrollment(instance_id, instance_ip, appliance_id, enrollment_token,
         'appliance_id': appliance_id,
         'enrollment_token': enrollment_token,
     }
+    # Pass DLP host URL if configured (triggers DLP config after enrollment)
+    dlp_host_url = os.environ.get('DLP_HOST_URL', '')
+    if dlp_host_url:
+        sfn_input['dlp_host_url'] = dlp_host_url
     if lifecycle_detail:
         sfn_input['lifecycle'] = {
             'hook_name': lifecycle_detail.get('LifecycleHookName', ''),

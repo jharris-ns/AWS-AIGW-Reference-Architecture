@@ -1,0 +1,668 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  DLPoD tethering and ALB test. Deploys a DLP On Demand appliance behind
+  a private ALB with a self-signed certificate, plus Lambda automation
+  for CLI-driven tethering via Step Functions.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC to deploy into
+
+  AlbSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: >
+      Two subnets in different AZs for the internal ALB. These can be
+      public or private subnets — the ALB uses internal scheme regardless.
+      Each subnet must have at least 8 free IPs (/24 or larger recommended).
+
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: >
+      One or two private subnets with NAT gateway for outbound. Used for
+      the DLPoD instance and Lambda functions. First subnet is used for
+      the DLPoD instance.
+
+  LambdaCodeBucket:
+    Type: String
+    Description: S3 bucket containing Lambda packages and layers
+
+  DlpodLambdaCodeKey:
+    Type: String
+    Default: lambda-dlpod.zip
+    Description: S3 key for the DLPoD Lambda package
+
+  LayerKey:
+    Type: String
+    Default: layers/pexpect-layer.zip
+    Description: S3 key for the paramiko/pyte Lambda Layer
+
+  DlpodAmiId:
+    Type: AWS::EC2::Image::Id
+    Description: DLP On Demand appliance AMI ID
+
+  DlpodInstanceType:
+    Type: String
+    Default: c5a.4xlarge
+    AllowedValues:
+      - c5a.4xlarge
+      - c5a.8xlarge
+      - c5a.16xlarge
+      - c5ad.4xlarge
+      - c5ad.8xlarge
+      - c5ad.16xlarge
+    Description: >
+      DLPoD instance type. c5a is available in most regions;
+      c5ad adds local NVMe but has limited AZ availability.
+
+  DlpodLicenseKey:
+    Type: String
+    NoEcho: true
+    Description: >
+      DLPoD license key from Netskope tenant
+      (Settings > Security Cloud Platform > On-Premises Infrastructure)
+
+  DnsServer:
+    Type: String
+    Default: ''
+    Description: >
+      DNS server IP for the DLPoD appliance. For AWS VPCs, use VPC CIDR
+      base + 2 (e.g. 10.0.0.2 for 10.0.0.0/16). Leave empty to skip.
+
+  DlpDomainName:
+    Type: String
+    Default: dlp.aigw.internal
+    Description: >
+      FQDN for the DLPoD ALB. A Route 53 private hosted zone is created
+      for the parent domain. The self-signed cert CN matches this name.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Network Configuration
+        Parameters:
+          - VpcId
+          - AlbSubnetIds
+          - PrivateSubnetIds
+          - DnsServer
+      - Label:
+          default: DLPoD Appliance
+        Parameters:
+          - DlpodAmiId
+          - DlpodInstanceType
+          - DlpodLicenseKey
+          - DlpDomainName
+      - Label:
+          default: Lambda Configuration
+        Parameters:
+          - LambdaCodeBucket
+          - DlpodLambdaCodeKey
+          - LayerKey
+
+Resources:
+  # =========================================================
+  # DLPoD Credentials (license key + password)
+  # =========================================================
+
+  DlpodCredentialsSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}-dlpod-creds'
+      Description: DLPoD license key and appliance password
+      SecretString: !Sub >
+        {
+          "license_key": "${DlpodLicenseKey}",
+          "default_password": "nsappliance",
+          "password": ""
+        }
+
+  # =========================================================
+  # DLPoD Certificate Parameter (SSM)
+  # =========================================================
+
+  DlpodCertParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${AWS::StackName}/dlpod-cert'
+      Type: String
+      Value: pending
+      Description: ALB certificate PEM (populated by cert generator custom resource)
+
+  # =========================================================
+  # Networking — Security Groups
+  # =========================================================
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Lambda for DLPoD CLI automation
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+          Description: All outbound
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-lambda-sg'
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Private ALB for DLPoD service
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: '10.0.0.0/8'
+          Description: HTTPS from RFC1918 10.x
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: '172.16.0.0/12'
+          Description: HTTPS from RFC1918 172.x
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: '192.168.0.0/16'
+          Description: HTTPS from RFC1918 192.x
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: '0.0.0.0/0'
+          Description: HTTPS to DLPoD target
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-alb-sg'
+
+  DlpodSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: DLPoD appliance
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+          Description: SSH from Lambda (CLI automation)
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+          Description: HTTPS from ALB
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+          Description: HTTPS from Lambda (cert extraction)
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+          Description: All outbound (tethering to Netskope management plane)
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-dlpod-sg'
+
+  # =========================================================
+  # Route 53 Private Hosted Zone
+  # =========================================================
+
+  PrivateHostedZone:
+    Type: AWS::Route53::HostedZone
+    Properties:
+      Name: aigw.internal
+      VPCs:
+        - VPCId: !Ref VpcId
+          VPCRegion: !Ref 'AWS::Region'
+      HostedZoneConfig:
+        Comment: !Sub 'Private zone for ${AWS::StackName} DLPoD ALB'
+
+  DlpodDnsRecord:
+    Type: AWS::Route53::RecordSet
+    DependsOn: DlpodAlb
+    Properties:
+      HostedZoneId: !Ref PrivateHostedZone
+      Name: !Ref DlpDomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt DlpodAlb.DNSName
+        HostedZoneId: !GetAtt DlpodAlb.CanonicalHostedZoneID
+
+  # =========================================================
+  # Self-Signed Certificate — Generation + ACM Import
+  # =========================================================
+
+  CertGeneratorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-certgen-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CertGenPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - acm:ImportCertificate
+                  - acm:DeleteCertificate
+                  - acm:AddTagsToCertificate
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ssm:PutParameter
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  CertGeneratorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-certgen'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt CertGeneratorRole.Arn
+      Code:
+        ZipFile: |
+          import json, subprocess, tempfile, os, logging, urllib.request, boto3
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          acm = boto3.client('acm')
+          ssm = boto3.client('ssm')
+          def send_cfn(event, context, status, data={}, pid=None):
+              body = json.dumps({'Status': status, 'Reason': f'See CloudWatch {context.log_group_name}/{context.log_stream_name}', 'PhysicalResourceId': pid or event.get('PhysicalResourceId','none'), 'StackId': event['StackId'], 'RequestId': event['RequestId'], 'LogicalResourceId': event['LogicalResourceId'], 'Data': data}).encode()
+              urllib.request.urlopen(urllib.request.Request(event['ResponseURL'], data=body, headers={'Content-Type':'','Content-Length':str(len(body))}, method='PUT'))
+          def handler(event, context):
+              domain = event['ResourceProperties']['DomainName']
+              cert_param = event['ResourceProperties']['CertParameterName']
+              stack = event['ResourceProperties']['StackName']
+              rt = event['RequestType']
+              try:
+                  if rt in ('Create', 'Update'):
+                      with tempfile.TemporaryDirectory() as d:
+                          kf, cf, sc = f'{d}/k.pem', f'{d}/c.pem', f'{d}/s.cnf'
+                          subprocess.run(['openssl','genrsa','-out',kf,'2048'], check=True, capture_output=True)
+                          with open(sc,'w') as f:
+                              f.write(f"[req]\ndistinguished_name=dn\nx509_extensions=v3\nprompt=no\n[dn]\nCN={domain}\nO=Netskope\nOU=AI Gateway\n[v3]\nsubjectAltName=DNS:{domain}\nbasicConstraints=critical,CA:TRUE\nkeyUsage=digitalSignature,keyEncipherment,keyCertSign\nextendedKeyUsage=serverAuth\n")
+                          subprocess.run(['openssl','req','-new','-x509','-key',kf,'-out',cf,'-days','365','-config',sc], check=True, capture_output=True)
+                          cert_pem = open(cf).read()
+                          key_pem = open(kf).read()
+                      r = acm.import_certificate(Certificate=cert_pem.encode(), PrivateKey=key_pem.encode(), Tags=[{'Key':'StackName','Value':stack}])
+                      arn = r['CertificateArn']
+                      ssm.put_parameter(Name=cert_param, Value=cert_pem, Type='String', Overwrite=True)
+                      send_cfn(event, context, 'SUCCESS', {'CertificateArn': arn}, arn)
+                  elif rt == 'Delete':
+                      arn = event.get('PhysicalResourceId','')
+                      if arn.startswith('arn:'):
+                          try: acm.delete_certificate(CertificateArn=arn)
+                          except: pass
+                      send_cfn(event, context, 'SUCCESS', {}, arn)
+              except Exception:
+                  logger.exception('Failed')
+                  send_cfn(event, context, 'FAILED', {}, 'FAILED')
+
+  AlbCertificate:
+    Type: Custom::AlbCertificate
+    Properties:
+      ServiceToken: !GetAtt CertGeneratorFunction.Arn
+      DomainName: !Ref DlpDomainName
+      CertParameterName: !Sub '/${AWS::StackName}/dlpod-cert'
+      StackName: !Ref 'AWS::StackName'
+      CertVersion: '2'
+
+  # =========================================================
+  # Private ALB for DLPoD Service
+  # =========================================================
+
+  DlpodAlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${AWS::StackName}-dlpod'
+      Scheme: internal
+      Type: application
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+      Subnets: !Ref AlbSubnetIds
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-dlpod-alb'
+
+  DlpodTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${AWS::StackName}-dlpod-tg'
+      Protocol: HTTPS
+      Port: 443
+      VpcId: !Ref VpcId
+      TargetType: instance
+      Targets:
+        - Id: !Ref DlpodInstance
+          Port: 443
+      HealthCheckProtocol: HTTPS
+      HealthCheckPort: '443'
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      Matcher:
+        HttpCode: 200-499
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-dlpod-tg'
+
+  DlpodHttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref DlpodAlb
+      Protocol: HTTPS
+      Port: 443
+      Certificates:
+        - CertificateArn: !GetAtt AlbCertificate.CertificateArn
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref DlpodTargetGroup
+
+  # =========================================================
+  # DLPoD Instance
+  # =========================================================
+
+  DlpodInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref DlpodAmiId
+      InstanceType: !Ref DlpodInstanceType
+      SubnetId: !Select [0, !Ref PrivateSubnetIds]
+      SecurityGroupIds:
+        - !Ref DlpodSecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 351
+            VolumeType: gp3
+            Encrypted: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-dlpod'
+
+  # =========================================================
+  # Lambda Layer + Function
+  # =========================================================
+
+  ParamikoLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub '${AWS::StackName}-paramiko'
+      Description: paramiko + pyte for CLI/TUI automation
+      CompatibleRuntimes:
+        - python3.12
+      Content:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref LayerKey
+
+  DlpodLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-dlpod-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DlpodPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: SecretsAccess
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:PutSecretValue
+                Resource: !Ref DlpodCredentialsSecret
+              - Sid: SSMAccess
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:PutParameter
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/*'
+              - Sid: VPCNetworking
+                Effect: Allow
+                Action:
+                  - ec2:CreateNetworkInterface
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DeleteNetworkInterface
+                Resource: '*'
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  DlpodLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-dlpod'
+      Description: DLPoD CLI automation handler (tethering, cert generation)
+      Runtime: python3.12
+      Handler: dlpod_handlers.handler
+      Timeout: 120
+      MemorySize: 256
+      Role: !GetAtt DlpodLambdaRole.Arn
+      Layers:
+        - !Ref ParamikoLayer
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds: !Ref PrivateSubnetIds
+      Environment:
+        Variables:
+          DLPOD_SECRET_ARN: !Ref DlpodCredentialsSecret
+          DLPOD_CERT_PARAM: !Sub '/${AWS::StackName}/dlpod-cert'
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref DlpodLambdaCodeKey
+
+  # =========================================================
+  # Step Functions State Machine — DLPoD Tethering
+  # =========================================================
+
+  StepFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-sfn-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt DlpodLambdaFunction.Arn
+
+  DlpodTetheringStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${AWS::StackName}-tethering'
+      RoleArn: !GetAtt StepFunctionRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "DLPoD appliance tethering and certificate setup",
+          "StartAt": "WaitForDlpodSSH",
+          "States": {
+            "WaitForDlpodSSH": {
+              "Type": "Task",
+              "Resource": "${DlpodLambdaFunction.Arn}",
+              "Parameters": {
+                "action": "dlpod_check_ssh",
+                "dlpod_ip.$": "$.dlpod_ip"
+              },
+              "ResultPath": "$.ssh_check",
+              "Next": "IsDlpodSSHReady",
+              "Catch": [{
+                "ErrorEquals": ["States.ALL"],
+                "Next": "WaitBeforeSSHRetry",
+                "ResultPath": "$.error"
+              }]
+            },
+            "IsDlpodSSHReady": {
+              "Type": "Choice",
+              "Choices": [{
+                "Variable": "$.ssh_check.ssh_ready",
+                "BooleanEquals": true,
+                "Next": "ChangePassword"
+              }],
+              "Default": "WaitBeforeSSHRetry"
+            },
+            "WaitBeforeSSHRetry": {
+              "Type": "Wait",
+              "Seconds": 15,
+              "Next": "WaitForDlpodSSH"
+            },
+            "ChangePassword": {
+              "Type": "Task",
+              "Resource": "${DlpodLambdaFunction.Arn}",
+              "Parameters": {
+                "action": "dlpod_change_password",
+                "dlpod_ip.$": "$.dlpod_ip"
+              },
+              "ResultPath": "$.password_result",
+              "Next": "SetDNS",
+              "Catch": [{
+                "ErrorEquals": ["States.ALL"],
+                "Next": "TetheringFailed",
+                "ResultPath": "$.error"
+              }]
+            },
+            "SetDNS": {
+              "Type": "Task",
+              "Resource": "${DlpodLambdaFunction.Arn}",
+              "Parameters": {
+                "action": "dlpod_set_dns",
+                "dlpod_ip.$": "$.dlpod_ip",
+                "dns_primary.$": "$.dns_primary"
+              },
+              "ResultPath": "$.dns_result",
+              "Next": "SetLicenseKey",
+              "Catch": [{
+                "ErrorEquals": ["States.ALL"],
+                "Next": "TetheringFailed",
+                "ResultPath": "$.error"
+              }]
+            },
+            "SetLicenseKey": {
+              "Type": "Task",
+              "Resource": "${DlpodLambdaFunction.Arn}",
+              "Parameters": {
+                "action": "dlpod_set_license",
+                "dlpod_ip.$": "$.dlpod_ip"
+              },
+              "ResultPath": "$.license_result",
+              "Next": "WaitForTetheringInit",
+              "Catch": [{
+                "ErrorEquals": ["States.ALL"],
+                "Next": "TetheringFailed",
+                "ResultPath": "$.error"
+              }]
+            },
+            "WaitForTetheringInit": {
+              "Type": "Wait",
+              "Seconds": 120,
+              "Next": "CheckTethering"
+            },
+            "CheckTethering": {
+              "Type": "Task",
+              "Resource": "${DlpodLambdaFunction.Arn}",
+              "Parameters": {
+                "action": "dlpod_check_tethering",
+                "dlpod_ip.$": "$.dlpod_ip"
+              },
+              "ResultPath": "$.tethering",
+              "Next": "IsTetheringComplete",
+              "Catch": [{
+                "ErrorEquals": ["States.ALL"],
+                "Next": "WaitBeforeTetheringRetry",
+                "ResultPath": "$.error"
+              }]
+            },
+            "IsTetheringComplete": {
+              "Type": "Choice",
+              "Choices": [{
+                "Variable": "$.tethering.tethered",
+                "BooleanEquals": true,
+                "Next": "TetheringComplete"
+              }],
+              "Default": "WaitBeforeTetheringRetry"
+            },
+            "WaitBeforeTetheringRetry": {
+              "Type": "Wait",
+              "Seconds": 60,
+              "Next": "CheckTethering"
+            },
+            "TetheringComplete": {
+              "Type": "Succeed"
+            },
+            "TetheringFailed": {
+              "Type": "Fail",
+              "Error": "TetheringFailed",
+              "Cause": "DLPoD tethering did not complete successfully"
+            }
+          }
+        }
+
+Outputs:
+  DlpodInstanceId:
+    Value: !Ref DlpodInstance
+  DlpodPrivateIp:
+    Value: !GetAtt DlpodInstance.PrivateIp
+  DlpodAlbDnsName:
+    Value: !GetAtt DlpodAlb.DNSName
+  DlpHostUrl:
+    Description: DLP host URL for AI Gateway configuration
+    Value: !Sub 'https://${DlpDomainName}'
+  AlbCertificateArn:
+    Value: !GetAtt AlbCertificate.CertificateArn
+  CertParameterName:
+    Value: !Sub '/${AWS::StackName}/dlpod-cert'
+  LambdaFunctionName:
+    Value: !Ref DlpodLambdaFunction
+  StateMachineArn:
+    Value: !Ref DlpodTetheringStateMachine
+  PrivateHostedZoneId:
+    Value: !Ref PrivateHostedZone
+
+  StateMachineInput:
+    Description: Full tethering state machine execution input
+    Value: !Sub |
+      {
+        "dlpod_ip": "${DlpodInstance.PrivateIp}",
+        "dlpod_hostname": "${DlpDomainName}",
+        "dns_primary": "${DnsServer}"
+      }

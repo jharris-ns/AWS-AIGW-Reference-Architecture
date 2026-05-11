@@ -46,6 +46,13 @@ if [ ! -f "$SCRIPT_DIR/lambda-step-function.zip" ]; then
   bash "$SCRIPT_DIR/build-step-function-lambda.sh"
 fi
 
+# Build DLPoD Lambda if missing
+if [ ! -f "$SCRIPT_DIR/lambda-dlpod.zip" ]; then
+  echo ""
+  echo "Building DLPoD Lambda..."
+  bash "$SCRIPT_DIR/build-dlpod-lambda.sh"
+fi
+
 # Build Layer if missing
 if [ ! -f "$SCRIPT_DIR/pexpect-layer.zip" ]; then
   echo ""
@@ -64,6 +71,9 @@ aws s3 cp "$SCRIPT_DIR/lambda-activation.zip" \
 
 aws s3 cp "$SCRIPT_DIR/lambda-step-function.zip" \
   "s3://${BUCKET}/lambda-step-function.zip" --region "$REGION"
+
+aws s3 cp "$SCRIPT_DIR/lambda-dlpod.zip" \
+  "s3://${BUCKET}/lambda-dlpod.zip" --region "$REGION"
 
 aws s3 cp "$SCRIPT_DIR/pexpect-layer.zip" \
   "s3://${BUCKET}/layers/pexpect-layer.zip" --region "$REGION"

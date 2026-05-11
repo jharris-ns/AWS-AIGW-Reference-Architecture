@@ -25,6 +25,8 @@ Each gateway instance is automatically enrolled and configured through this chai
 5. Instance moves to `InService`
 6. On termination: Activation Lambda deregisters appliance from tenant, cleans up SSM parameter (appliance ID only)
 
+DLPoD (DLP On Demand) appliances run in a separate ASG with their own lifecycle hooks, mirroring the gateway pattern. Each DLPoD instance is automatically tethered to the Netskope management plane. The AIG enrollment state machine configures DLP on each gateway after enrollment completes.
+
 ### Secret Handling
 
 Netskope API credentials never touch the gateway instances. The Activation Lambda reads from Secrets Manager and calls the Netskope API to generate an enrollment token, which exists only in Lambda memory. The token is passed directly to the instance over SSH and never persisted to any AWS storage service. The instance IAM role only needs CloudWatch Logs permissions — no access to Secrets Manager or Parameter Store.
@@ -37,20 +39,25 @@ Build Lambda artifacts and deploy:
 # Build and upload Lambda packages to S3
 scripts/deploy-artifacts.sh us-west-1
 
+# Upload template to S3 (required — template exceeds 51KB)
+aws s3 cp templates/gateway-asg.yaml s3://<s3-bucket>/templates/gateway-asg.yaml
+
 # Deploy with a new VPC (omit Existing* parameters)
 aws cloudformation create-stack \
   --stack-name <name> \
-  --template-body file://templates/gateway-asg.yaml \
+  --template-url https://<s3-bucket>.s3.<region>.amazonaws.com/templates/gateway-asg.yaml \
   --parameters \
     ParameterKey=NetskopeTenantUrl,ParameterValue=https://tenant.goskope.com \
     ParameterKey=NetskopeApiToken,ParameterValue=<token> \
-    ParameterKey=AcmCertificateArn,ParameterValue=<acm-arn> \
     ParameterKey=GatewayAmiId,ParameterValue=<ami-id> \
     ParameterKey=LambdaCodeBucket,ParameterValue=<s3-bucket> \
+    ParameterKey=DlpodAmiId,ParameterValue=<dlpod-ami-id> \
+    ParameterKey=DlpodLicenseKey,ParameterValue=<license-key> \
+    ParameterKey=DnsServer,ParameterValue=<dns-ip> \
   --capabilities CAPABILITY_NAMED_IAM
 ```
 
-The template is under 51KB and can be deployed directly with `--template-body` — no S3 upload needed for the template itself. Only the Lambda packages and Layer need S3.
+The template exceeds 51KB and must be uploaded to S3 before deployment. Use `--template-url` to reference the S3 location.
 
 See [DEPLOYMENT.md](docs/DEPLOYMENT.md) for full instructions including existing VPC deployments and artifact updates.
 
@@ -63,10 +70,14 @@ See [DEPLOYMENT.md](docs/DEPLOYMENT.md) for full instructions including existing
 | Scale out | `aws autoscaling update-auto-scaling-group --auto-scaling-group-name <stack>-asg --desired-capacity <N>` |
 | View enrollment logs | `aws logs tail /aws/lambda/<stack>-enrollment --since 30m` |
 | View activation logs | `aws logs tail /aws/lambda/<stack>-activation --since 30m` |
+| Check DLPoD instances | `aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names <stack>-dlpod-asg --query "AutoScalingGroups[0].Instances[*].[InstanceId,LifecycleState]" --output table` |
+| Check DLPoD tethering | `aws stepfunctions list-executions --state-machine-arn arn:aws:states:<region>:<account>:stateMachine:<stack>-dlpod-tethering --output table` |
+| Scale DLPoD | `aws autoscaling update-auto-scaling-group --auto-scaling-group-name <stack>-dlpod-asg --desired-capacity <N>` |
+| View DLPoD logs | `aws logs tail /aws/lambda/<stack>-dlpod --since 30m` |
 
 ## Rules
 
-- **Lambda artifacts must be uploaded to S3** before deployment. The S3 bucket must be in the same region as the stack. The template itself is under 51KB and can be deployed directly with `--template-body`.
+- **Lambda artifacts and the template must be uploaded to S3** before deployment. The S3 bucket must be in the same region as the stack. The template exceeds 51KB and must be deployed via S3 `--template-url`.
 - **CUDA NVIDIA GPU required** for advanced AI guardrails — standard guardrails work on CPU instances (m5.4xlarge), but advanced guardrails need GPU instances (g4dn, g5).
 
 ## Documentation
@@ -77,7 +88,8 @@ See [DEPLOYMENT.md](docs/DEPLOYMENT.md) for full instructions including existing
 | [DEPLOYMENT.md](docs/DEPLOYMENT.md) | Build artifacts, upload to S3, deploy |
 | [DEVOPS.md](docs/DEVOPS.md) | Lifecycle, scaling, secrets, VPC requirements |
 | [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Claude Code usage, AWS credentials, failure diagnosis, manual recovery |
-| [CERTIFICATE_MANAGEMENT.md](docs/CERTIFICATE_MANAGEMENT.md) | ACM certificate creation and import |
+| [CERTIFICATE_MANAGEMENT.md](docs/CERTIFICATE_MANAGEMENT.md) | Automatic certificate generation, requirements, renewal |
+| [DLPOD_AUTOMATION.md](docs/DLPOD_AUTOMATION.md) | DLPoD CLI reference, tethering flow, test results, gotchas |
 | [CLAUDE_DEV.md](CLAUDE_DEV.md) | Template conventions, resource inventory, development rules |
 
 ## Related Resources

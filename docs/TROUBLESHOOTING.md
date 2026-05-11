@@ -123,7 +123,6 @@ aws cloudformation create-change-set \
   --template-url https://<bucket>.s3.<region>.amazonaws.com/templates/gateway-asg.yaml \
   --parameters ParameterKey=NetskopeTenantUrl,ParameterValue=https://tenant.goskope.com \
     ParameterKey=NetskopeApiToken,ParameterValue=test \
-    ParameterKey=AcmCertificateArn,ParameterValue=arn:aws:acm:us-west-1:123:certificate/xxx \
     ParameterKey=GatewayAmiId,ParameterValue=ami-xxx \
     ParameterKey=LambdaCodeBucket,ParameterValue=my-bucket \
   --capabilities CAPABILITY_NAMED_IAM \

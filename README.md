@@ -2,13 +2,15 @@
 
 ## Overview
 
-This CloudFormation template (`templates/gateway-asg.yaml`) deploys two services:
+This CloudFormation template (`templates/gateway-asg.yaml`) deploys up to three services:
 
-**AI Gateway Service** — An Auto Scaling Group of Netskope AI Gateway instances behind an internet-facing Application Load Balancer. Each instance is automatically enrolled with the Netskope tenant, configured for DLP inspection, and placed into service — no manual setup required. The ASG scales independently based on capacity parameters.
+**AI Gateway Service** — An Auto Scaling Group of Netskope AI Gateway instances behind an internet-facing Application Load Balancer. Each instance is automatically enrolled with the Netskope tenant, configured for DLP and guardrails inspection, and placed into service — no manual setup required. The ASG scales independently based on capacity parameters.
 
 **DLP On Demand Service (Optional)** — When `DlpodAmiId` is provided, a second Auto Scaling Group of DLP On Demand (DLPoD) appliances is deployed behind a private internal ALB with a Route 53 private hosted zone (`dlp.aigw.internal`). Each DLPoD instance is automatically tethered to the Netskope management plane via lifecycle hooks. The AI Gateway instances are configured to forward content to the DLPoD service for inline DLP inspection.
 
-Both services use the same lifecycle automation pattern: ASG lifecycle hooks trigger Lambda functions that orchestrate configuration via Step Functions. TLS certificates for both ALBs are automatically generated at stack creation. Each service scales independently through its own ASG.
+**AI Guardrails LLM Service (Optional)** — When `GuardrailsImageUri` is provided, a GPU-backed Auto Scaling Group runs the Netskope `aisecurityllm` container behind a private internal ALB. The container provides high-efficacy prompt injection detection and content safety classification using a locally-hosted LLM. Each AI Gateway instance is automatically configured to use the guardrails service during enrollment. Requires NVIDIA GPU instances (g4dn or g5 family).
+
+The gateway and DLPoD services use ASG lifecycle hooks with Lambda and Step Functions for automated configuration. The guardrails service self-starts via UserData (ECR pull + `docker run --gpus all`) and requires no lifecycle automation. TLS certificates for all ALBs are automatically generated at stack creation. Each service scales independently through its own ASG.
 
 This repository includes a `CLAUDE.md` file that provides [Claude Code](https://docs.anthropic.com/en/docs/claude-code) with full project context. Claude Code can assist with deploying stacks, reading logs, diagnosing enrollment failures, and managing scaling operations. See [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) for usage examples.
 
@@ -76,7 +78,25 @@ To obtain these:
 - **DLPoD AMI** — The DLPoD AMI is available in the [AWS Marketplace](https://aws.amazon.com/marketplace). Search for "Netskope DLP On Demand" and subscribe. After subscribing, the AMI will be available in your account for the subscribed regions.
 - **License Key** — In your Netskope tenant, navigate to **Settings > Security Cloud Platform > On-Premises Infrastructure** to generate or retrieve a DLPoD license key.
 
-### 6. AWS Services and IAM Permissions
+### 6. AI Guardrails LLM (Optional)
+
+If you want GPU-based advanced AI guardrails (prompt injection detection, content safety classification), provide the guardrails container image URI (`GuardrailsImageUri`) and a GPU-capable AMI (`GuardrailsAmiId`) when deploying. The template conditionally deploys the guardrails service as part of the stack.
+
+To obtain these:
+- **Container Image** — Push the Netskope `aisecurityllm` Docker image to an ECR repository in your account. The image is provided by Netskope. See [Docker Deployment](https://docs.netskope.com/en/docker-deployment/) for details.
+- **GPU AMI** — Use an AWS Deep Learning AMI with NVIDIA drivers and Docker pre-installed. The PyTorch variant is recommended (e.g., `Deep Learning OSS Nvidia Driver AMI GPU PyTorch 2.11 (Amazon Linux 2023)`). The Base variant does **not** include Docker.
+
+**Hardware requirements** (per [Netskope docs](https://docs.netskope.com/en/docker-deployment/)):
+
+| Requirement | Minimum | Default instance (g4dn.xlarge) |
+|-------------|---------|-------------------------------|
+| GPU | 1x NVIDIA (CUDA) | 1x T4 |
+| GPU Memory | 16 GB | 16 GB |
+| vCPU | 2 | 4 |
+| RAM | 16 GB | 16 GB |
+| Storage | 50 GB | 100 GB (template default) |
+
+### 7. AWS Services and IAM Permissions
 
 The template creates resources across the following AWS services:
 
@@ -294,10 +314,18 @@ Before deploying, decide on these three options:
   - DLPoD AMI from the [AWS Marketplace](https://aws.amazon.com/marketplace) (search "Netskope DLP On Demand")
   - License key from your Netskope tenant (**Settings > Security Cloud Platform > On-Premises Infrastructure**)
 
-### Instance Type?
+### With Advanced Guardrails or Without?
 
-- **m5.4xlarge** (default) — CPU-only, supports standard AI guardrails. Sufficient for most deployments.
-- **GPU instances** (g4dn, g5) — Required for advanced AI guardrails that use CUDA/NVIDIA acceleration. You must update the `AllowedValues` constraint in the template to permit GPU instance types.
+- **Without Guardrails** — The gateway uses CPU-based guardrails built into the appliance. Sufficient for basic policy enforcement. Leave `GuardrailsImageUri` empty.
+- **With Advanced Guardrails** — Deploys the `aisecurityllm` container on GPU instances for high-efficacy prompt injection and content safety detection. Requires:
+  - Netskope `aisecurityllm` Docker image pushed to ECR
+  - GPU AMI (Deep Learning AMI with PyTorch, not Base)
+  - GPU instances cost ~$0.53/hr (g4dn.xlarge) per instance
+
+### Gateway Instance Type?
+
+- **m5.4xlarge** (default) — CPU-only, supports standard guardrails. Sufficient for most deployments.
+- **GPU instances** (g4dn, g5) — Only needed for the gateway itself if running advanced guardrails locally (not the typical deployment). The separate guardrails ASG handles GPU workloads.
 
 ---
 
@@ -341,6 +369,24 @@ aws cloudformation create-stack \
   --capabilities CAPABILITY_NAMED_IAM
 ```
 
+### Deploy with Advanced Guardrails
+
+To include GPU-based AI guardrails, add the guardrails parameters (can be combined with DLPoD):
+
+```bash
+aws cloudformation create-stack \
+  --stack-name my-aigw \
+  --template-url "https://${BUCKET}.s3.${REGION}.amazonaws.com/templates/gateway-asg.yaml" \
+  --parameters \
+    ParameterKey=NetskopeTenantUrl,ParameterValue=https://tenant.goskope.com \
+    ParameterKey=NetskopeApiToken,ParameterValue=<token> \
+    ParameterKey=GatewayAmiId,ParameterValue=<gateway-ami-id> \
+    ParameterKey=GuardrailsImageUri,ParameterValue=<account>.dkr.ecr.<region>.amazonaws.com/aisecurityllm:<tag> \
+    ParameterKey=GuardrailsAmiId,ParameterValue=<deep-learning-ami-id> \
+    ParameterKey=LambdaCodeBucket,ParameterValue=${BUCKET} \
+  --capabilities CAPABILITY_NAMED_IAM
+```
+
 ### Deploy with a new VPC
 
 Omit all `Existing*` parameters (or set them to empty strings). The template creates a VPC with public subnets, private subnets, an internet gateway, a NAT gateway, route tables, and all required VPC endpoints.
@@ -357,6 +403,8 @@ After deployment, the stack provides these outputs:
 | `VpcId` | VPC ID (created or existing) |
 | `PublicSubnetId` | Subnet 1 ID (created or existing) |
 | `GatewaySecurityGroupId` | Gateway security group ID |
+| `GuardrailsAlbDnsName` | Guardrails internal ALB DNS name (when deployed) |
+| `GuardrailsHostUrl` | Guardrails HTTPS URL for gateway configuration (when deployed) |
 
 ---
 
@@ -400,7 +448,7 @@ The template uses a split-subnet architecture: **public subnets** for the ALB an
 | `LambdaCodeKey` | No | S3 key for enrollment Lambda (default: `lambda-step-function.zip`). |
 | `LambdaLayerKey` | No | S3 key for paramiko/pyte Layer (default: `layers/pexpect-layer.zip`). |
 
-> **Note:** Advanced AI guardrails (beyond basic policy enforcement) require a CUDA-capable NVIDIA GPU. If advanced guardrails are needed, use GPU instance types (e.g., g4dn.4xlarge, g5.4xlarge) and update the `AllowedValues` constraint in the template.
+> **Note:** The gateway instances run standard (CPU-based) guardrails. For advanced GPU-based guardrails, deploy the separate guardrails service using the parameters below.
 
 ### Load Balancer Configuration
 
@@ -427,10 +475,26 @@ All DLPoD parameters are optional. Leave `DlpodAmiId` empty to skip DLPoD deploy
 | `DlpodLicenseKey` | No | DLPoD license key from Netskope tenant (NoEcho). Required when `DlpodAmiId` is provided. |
 | `DlpodLambdaCodeKey` | No | S3 key for DLPoD Lambda package (default: `lambda-dlpod.zip`). |
 | `DlpDomainName` | No | FQDN for the DLPoD private ALB (default: `dlp.aigw.internal`). Resolved via Route 53 private hosted zone. |
-| `DnsServer` | No | DNS server IP for DLPoD configuration. Leave empty if not required. |
+| `DnsServer` | No | DNS server IP for DLPoD. Auto-derived from VPC CIDR (base + 2) when empty. Only override for custom DNS. |
 | `DlpodMinCapacity` | No | Minimum number of DLPoD instances (default: `1`). |
 | `DlpodMaxCapacity` | No | Maximum number of DLPoD instances (default: `1`). |
 | `DlpodDesiredCapacity` | No | Desired number of DLPoD instances (default: `1`). |
+
+### AI Guardrails LLM Configuration
+
+All guardrails parameters are optional. Leave `GuardrailsImageUri` empty to skip guardrails deployment entirely.
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `GuardrailsImageUri` | No | ECR image URI for the `aisecurityllm` container. Leave empty to skip. |
+| `GuardrailsInstanceType` | No | GPU instance type (default: `g4dn.xlarge`). Allowed: g4dn.xlarge, g4dn.2xlarge, g5.xlarge, g5.2xlarge. |
+| `GuardrailsAmiId` | No | Deep Learning AMI with NVIDIA drivers and Docker. Required when `GuardrailsImageUri` is set. |
+| `GuardrailsContainerPort` | No | Port the container listens on (default: `8080`). |
+| `GuardrailsHealthCheckPath` | No | ALB health check path (default: `/`). |
+| `GuardrailsDomainName` | No | Certificate CN for the guardrails ALB (default: `guardrails.aigw.internal`). |
+| `GuardrailsMinCapacity` | No | Minimum GPU instances (default: `1`). |
+| `GuardrailsMaxCapacity` | No | Maximum GPU instances (default: `2`). |
+| `GuardrailsDesiredCapacity` | No | Desired GPU instances (default: `1`). |
 
 ### Tagging
 

@@ -439,6 +439,165 @@ def handle_configure_aig_dlp(event):
         session.disconnect()
 
 
+def handle_check_guardrails_cert(event):
+    """Check if the guardrails certificate is available in SSM."""
+    cert_param = os.environ.get('GUARDRAILS_CERT_PARAM', '')
+    if not cert_param:
+        return {**event, 'cert_ready': False, 'reason': 'no_cert_param'}
+
+    ssm = boto3.client('ssm')
+    try:
+        resp = ssm.get_parameter(Name=cert_param)
+        value = resp['Parameter']['Value']
+        cert_ready = value != 'pending' and '-----BEGIN CERTIFICATE-----' in value
+        return {**event, 'cert_ready': cert_ready}
+    except ssm.exceptions.ParameterNotFound:
+        return {**event, 'cert_ready': False, 'reason': 'param_not_found'}
+
+
+def handle_configure_aig_guardrails(event):
+    """Configure Guardrails LLM on the AI Gateway via TUI.
+
+    Navigates: Configure Content Inspection Services → Configure Guardrails LLM
+    → Configure LLM Service Certificate (paste cert)
+    → Configure LLM Service Host (enter URL)
+    """
+    instance_ip = event['instance_ip']
+    guardrails_host_url = event.get('guardrails_host_url', os.environ.get('GUARDRAILS_HOST_URL', ''))
+    private_key_pem = get_ssh_private_key()
+
+    if not guardrails_host_url:
+        return {**event, 'guardrails_configured': False, 'reason': 'no_guardrails_host_url'}
+
+    # Read cert from SSM
+    cert_param = os.environ.get('GUARDRAILS_CERT_PARAM', '')
+    if not cert_param:
+        return {**event, 'guardrails_configured': False, 'reason': 'no_cert_param'}
+
+    ssm = boto3.client('ssm')
+    resp = ssm.get_parameter(Name=cert_param)
+    cert_pem = resp['Parameter']['Value']
+    if '-----BEGIN CERTIFICATE-----' not in cert_pem:
+        return {**event, 'guardrails_configured': False, 'reason': 'cert_not_ready'}
+
+    session = create_session(instance_ip, private_key_pem)
+    try:
+        actions = TUIActions(session)
+
+        # Navigate to Configure Content Inspection Services
+        found = actions.select_menu_item("Configure Content Inspection Services")
+        if not found:
+            found = actions.select_menu_item("Configure AI Services")
+        if not found:
+            return {**event, 'guardrails_configured': False, 'reason': 'cis_menu_not_found',
+                    'screen': session.get_screen_text()[:500]}
+
+        time.sleep(2)
+        session.child._drain(timeout=2)
+
+        # Select Configure Guardrails LLM (AIG 1.3+ naming)
+        found = actions.select_menu_item("Configure Guardrails LLM")
+        if not found:
+            # Try alternate names
+            found = actions.select_menu_item("LLM Guardrails Service")
+        if not found:
+            found = actions.select_menu_item("AI Guardrails")
+        if not found:
+            return {**event, 'guardrails_configured': False, 'reason': 'guardrails_menu_not_found',
+                    'screen': session.get_screen_text()[:500]}
+
+        time.sleep(2)
+        session.child._drain(timeout=2)
+
+        # Step 1: Configure Guardrails LLM Certificate
+        found = actions.select_menu_item("Configure Guardrails LLM Certificate")
+        if not found:
+            found = actions.select_menu_item("Configure LLM Service Certificate")
+        if not found:
+            return {**event, 'guardrails_configured': False, 'reason': 'cert_menu_not_found',
+                    'screen': session.get_screen_text()[:500]}
+
+        time.sleep(2)
+        session.child._drain(timeout=2)
+
+        # Wait for cert input prompt
+        idx = session.child.expect(
+            [r'[Ee]nter new certificate', r'certificate', ChannelWrapper.TIMEOUT],
+            timeout=15,
+        )
+        if idx == 2:
+            return {**event, 'guardrails_configured': False, 'reason': 'cert_prompt_timeout',
+                    'screen': session.get_screen_text()[:500]}
+
+        screen_before = session.get_screen_text()
+        logger.info('GUARDRAILS_CERT_INPUT_SCREEN: [%s]', repr(screen_before[:500]))
+
+        # Collapse cert PEM and paste via bracketed paste mode
+        cert_lines = cert_pem.strip().split('\n')
+        begin_line = cert_lines[0]
+        end_line = cert_lines[-1]
+        b64_body = ''.join(cert_lines[1:-1])
+        cert_collapsed = f'{begin_line}\n{b64_body}\n{end_line}'
+        logger.info('GUARDRAILS_CERT_COLLAPSED: %d chars (body: %d)', len(cert_collapsed), len(b64_body))
+
+        PASTE_START = '\x1b[200~'
+        PASTE_END = '\x1b[201~'
+        session.child.send(PASTE_START + cert_collapsed + PASTE_END)
+        time.sleep(3)
+        session.child._drain(timeout=2)
+
+        # Press Enter to submit
+        session.press_enter()
+        time.sleep(8)
+        session.child._drain(timeout=5)
+
+        screen = session.get_screen_text()
+        logger.info('GUARDRAILS_AFTER_CERT_SUBMIT: [%s]', repr(screen[:500]))
+        if re.search(r'[Ff]ailed|[Ii]nvalid|response code', screen):
+            return {**event, 'guardrails_configured': False, 'reason': 'cert_validation_failed',
+                    'screen': screen[:1500]}
+
+        logger.info('Guardrails certificate configured on AIG')
+
+        # Go back to guardrails menu
+        session.press_escape()
+        time.sleep(2)
+        session.child._drain(timeout=2)
+
+        # Step 2: Configure Guardrails LLM Host
+        found = actions.select_menu_item("Configure Guardrails LLM Host")
+        if not found:
+            found = actions.select_menu_item("Configure LLM Service Host")
+        if not found:
+            return {**event, 'guardrails_configured': False, 'reason': 'host_menu_not_found',
+                    'screen': session.get_screen_text()[:500]}
+
+        time.sleep(2)
+        session.child._drain(timeout=2)
+
+        # Wait for host URL input prompt
+        idx = session.child.expect(
+            [r'[Ee]nter new [Hh]ost', r'[Hh]ost URL', ChannelWrapper.TIMEOUT],
+            timeout=15,
+        )
+        if idx == 2:
+            return {**event, 'guardrails_configured': False, 'reason': 'host_prompt_timeout',
+                    'screen': session.get_screen_text()[:500]}
+
+        # Enter guardrails host URL
+        session.child.send(guardrails_host_url)
+        time.sleep(0.5)
+        session.press_enter()
+        time.sleep(3)
+        session.child._drain(timeout=3)
+
+        logger.info('Guardrails host configured on AIG: %s', guardrails_host_url)
+
+        return {**event, 'guardrails_configured': True}
+    finally:
+        session.disconnect()
+
+
 def handle_configure_aig_dlp_api(event):
     """Configure DLP on the AI Gateway via its local REST API.
 
@@ -564,6 +723,8 @@ def handler(event, context):
         'submit_token': handle_submit_token,
         'check_dlpod_cert': handle_check_dlpod_cert,
         'configure_aig_dlp': handle_configure_aig_dlp,
+        'check_guardrails_cert': handle_check_guardrails_cert,
+        'configure_aig_guardrails': handle_configure_aig_guardrails,
         'configure_aig_dlp_api': handle_configure_aig_dlp_api,
         'complete_lifecycle': handle_complete_lifecycle,
     }

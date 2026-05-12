@@ -22,6 +22,18 @@ Metadata:
           - DlpDomainName
           - DnsServer
       - Label:
+          default: AI Guardrails LLM (Optional)
+        Parameters:
+          - GuardrailsImageUri
+          - GuardrailsInstanceType
+          - GuardrailsAmiId
+          - GuardrailsContainerPort
+          - GuardrailsHealthCheckPath
+          - GuardrailsDomainName
+          - GuardrailsMinCapacity
+          - GuardrailsMaxCapacity
+          - GuardrailsDesiredCapacity
+      - Label:
           default: Network Configuration
         Parameters:
           - ExistingVpcId
@@ -110,6 +122,24 @@ Metadata:
         default: DLPoD Domain Name
       DnsServer:
         default: DLPoD DNS Server
+      GuardrailsImageUri:
+        default: Guardrails ECR Image URI (optional)
+      GuardrailsInstanceType:
+        default: Guardrails GPU Instance Type
+      GuardrailsAmiId:
+        default: Guardrails AMI ID (optional)
+      GuardrailsContainerPort:
+        default: Guardrails Container Port
+      GuardrailsHealthCheckPath:
+        default: Guardrails Health Check Path
+      GuardrailsDomainName:
+        default: Guardrails Domain Name
+      GuardrailsMinCapacity:
+        default: Guardrails Minimum Instances
+      GuardrailsMaxCapacity:
+        default: Guardrails Maximum Instances
+      GuardrailsDesiredCapacity:
+        default: Guardrails Desired Instances
       Project:
         default: Project Name
       Environment:
@@ -290,6 +320,59 @@ Parameters:
     Default: ''
     Description: 'DNS server IP for DLPoD. For new VPCs use VPC CIDR base + 2. Leave empty to auto-derive.'
 
+  GuardrailsImageUri:
+    Type: String
+    Default: ''
+    Description: 'ECR image URI for the AI Guardrails LLM container (e.g., 123456789012.dkr.ecr.us-west-1.amazonaws.com/aisecurityllm:latest). Leave empty to skip guardrails deployment.'
+
+  GuardrailsInstanceType:
+    Type: String
+    Default: g4dn.xlarge
+    AllowedValues:
+      - g4dn.xlarge
+      - g4dn.2xlarge
+      - g5.xlarge
+      - g5.2xlarge
+    Description: 'GPU instance type for guardrails. Requires 1 NVIDIA GPU with >= 16 GB VRAM.'
+
+  GuardrailsAmiId:
+    Type: String
+    Default: ''
+    Description: 'Deep Learning Base AMI ID with NVIDIA drivers and Docker. Required when GuardrailsImageUri is set.'
+
+  GuardrailsContainerPort:
+    Type: Number
+    Default: 8080
+    Description: 'Port the guardrails container listens on.'
+
+  GuardrailsHealthCheckPath:
+    Type: String
+    Default: '/'
+    Description: 'ALB health check path for the guardrails container.'
+
+  GuardrailsDomainName:
+    Type: String
+    Default: guardrails.aigw.internal
+    Description: 'FQDN for the guardrails internal ALB certificate CN.'
+
+  GuardrailsMinCapacity:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    Description: Minimum number of guardrails GPU instances
+
+  GuardrailsMaxCapacity:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    Description: Maximum number of guardrails GPU instances
+
+  GuardrailsDesiredCapacity:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    Description: Desired number of guardrails GPU instances
+
   Project:
     Type: String
     Default: netskope-ai-gateway
@@ -332,6 +415,8 @@ Conditions:
   CreateNewPrivateSubnet: !Equals [!Ref ExistingPrivateSubnetId, '']
   CreateNewPrivateSubnet2: !Equals [!Ref ExistingPrivateSubnet2Id, '']
   DeployDlpod: !Not [!Equals [!Ref DlpodAmiId, '']]
+  DeployGuardrails: !Not [!Equals [!Ref GuardrailsImageUri, '']]
+  AutoDeriveDns: !Equals [!Ref DnsServer, '']
 
 Resources:
 
@@ -985,6 +1070,7 @@ Resources:
           SECRET_ARN: !Ref NetskopeSecret
           STATE_MACHINE_ARN: !Ref EnrollmentStateMachine
           DLP_HOST_URL: !If [DeployDlpod, !Sub 'https://${DlpDomainName}', '']
+          GUARDRAILS_HOST_URL: !If [DeployGuardrails, !Sub 'https://${GuardrailsDomainName}', '']
       Code:
         S3Bucket: !Ref LambdaCodeBucket
         S3Key: !Ref ActivationLambdaCodeKey
@@ -1108,6 +1194,8 @@ Resources:
           NETSKOPE_SECRET_ARN: !Ref NetskopeSecret
           DLPOD_CERT_PARAM: !If [DeployDlpod, !Sub '/${AWS::StackName}/dlpod-cert', '']
           DLP_HOST_URL: !If [DeployDlpod, !Sub 'https://${DlpDomainName}', '']
+          GUARDRAILS_CERT_PARAM: !If [DeployGuardrails, !Sub '/${AWS::StackName}/guardrails-cert', '']
+          GUARDRAILS_HOST_URL: !If [DeployGuardrails, !Sub 'https://${GuardrailsDomainName}', '']
       Code:
         S3Bucket: !Ref LambdaCodeBucket
         S3Key: !Ref LambdaCodeKey
@@ -1295,11 +1383,18 @@ Resources:
             },
             "EnrollmentComplete": {
               "Type": "Choice",
-              "Choices": [{
-                "Variable": "$.dlp_host_url",
-                "IsPresent": true,
-                "Next": "CheckDlpodCertReady"
-              }],
+              "Choices": [
+                {
+                  "Variable": "$.dlp_host_url",
+                  "IsPresent": true,
+                  "Next": "CheckDlpodCertReady"
+                },
+                {
+                  "Variable": "$.guardrails_host_url",
+                  "IsPresent": true,
+                  "Next": "CheckGuardrailsCertReady"
+                }
+              ],
               "Default": "CompleteLifecycle"
             },
             "CheckDlpodCertReady": {
@@ -1333,8 +1428,46 @@ Resources:
             },
             "CheckDlpResult": {
               "Type": "Choice",
-              "Choices": [{"Variable": "$.dlp_result.dlp_configured", "BooleanEquals": true, "Next": "CompleteLifecycle"}],
+              "Choices": [{"Variable": "$.dlp_result.dlp_configured", "BooleanEquals": true, "Next": "CheckGuardrailsNeeded"}],
+              "Default": "CheckGuardrailsNeeded"
+            },
+            "CheckGuardrailsNeeded": {
+              "Type": "Choice",
+              "Choices": [{
+                "Variable": "$.guardrails_host_url",
+                "IsPresent": true,
+                "Next": "CheckGuardrailsCertReady"
+              }],
               "Default": "CompleteLifecycle"
+            },
+            "CheckGuardrailsCertReady": {
+              "Type": "Task",
+              "Resource": "${EnrollmentLambdaFunction.Arn}",
+              "Parameters": {
+                "action": "check_guardrails_cert",
+                "instance_ip.$": "$.instance_ip"
+              },
+              "ResultPath": "$.guardrails_cert_check",
+              "Next": "IsGuardrailsCertReady",
+              "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "WaitForGuardrailsCert", "ResultPath": "$.error"}]
+            },
+            "IsGuardrailsCertReady": {
+              "Type": "Choice",
+              "Choices": [{"Variable": "$.guardrails_cert_check.cert_ready", "BooleanEquals": true, "Next": "ConfigureAigGuardrails"}],
+              "Default": "WaitForGuardrailsCert"
+            },
+            "WaitForGuardrailsCert": {"Type": "Wait", "Seconds": 30, "Next": "CheckGuardrailsCertReady"},
+            "ConfigureAigGuardrails": {
+              "Type": "Task",
+              "Resource": "${EnrollmentLambdaFunction.Arn}",
+              "Parameters": {
+                "action": "configure_aig_guardrails",
+                "instance_ip.$": "$.instance_ip",
+                "guardrails_host_url.$": "$.guardrails_host_url"
+              },
+              "ResultPath": "$.guardrails_result",
+              "Next": "CompleteLifecycle",
+              "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "CompleteLifecycle", "ResultPath": "$.guardrails_error"}]
             },
             "CompleteLifecycle": {
               "Type": "Task",
@@ -1745,7 +1878,15 @@ Resources:
       Environment:
         Variables:
           STATE_MACHINE_ARN: !Ref DlpodTetheringStateMachine
-          DNS_SERVER: !Ref DnsServer
+          DNS_SERVER: !If
+            - AutoDeriveDns
+            - !Join
+              - '.'
+              - - !Select [0, !Split ['.', !Select [0, !Split ['/', !Ref VpcCidr]]]]
+                - !Select [1, !Split ['.', !Select [0, !Split ['/', !Ref VpcCidr]]]]
+                - !Select [2, !Split ['.', !Select [0, !Split ['/', !Ref VpcCidr]]]]
+                - '2'
+            - !Ref DnsServer
       Code:
         ZipFile: |
           import json, os, logging, secrets, string
@@ -1955,6 +2096,275 @@ Resources:
             "DlpodTetheringFailed": {"Type": "Fail", "Error": "DlpodTetheringFailed", "Cause": "DLPoD tethering failed"}
           }
         }
+
+  # ============================================================
+  # AI Guardrails LLM (conditional — only when GuardrailsImageUri is set)
+  # GPU container behind an internal ALB. No lifecycle hooks —
+  # container self-starts via UserData (ECR pull + docker run).
+  # ============================================================
+
+  GuardrailsRole:
+    Type: AWS::IAM::Role
+    Condition: DeployGuardrails
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-guardrails-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EcrPullAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: EcrAuth
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Sid: EcrPull
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource: !Sub 'arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/*'
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*'
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  GuardrailsInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Condition: DeployGuardrails
+    Properties:
+      InstanceProfileName: !Sub '${AWS::StackName}-guardrails-profile'
+      Roles:
+        - !Ref GuardrailsRole
+
+  GuardrailsAlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: DeployGuardrails
+    Properties:
+      GroupDescription: Internal ALB for AI Guardrails service
+      VpcId: !If [CreateNewVpc, !Ref Vpc, !Ref ExistingVpcId]
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref GatewaySecurityGroup
+          Description: HTTPS from AI Gateway instances
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: !Ref GuardrailsContainerPort
+          ToPort: !Ref GuardrailsContainerPort
+          CidrIp: '0.0.0.0/0'
+          Description: HTTP to guardrails container
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-guardrails-alb-sg'
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  GuardrailsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: DeployGuardrails
+    Properties:
+      GroupDescription: AI Guardrails GPU instances
+      VpcId: !If [CreateNewVpc, !Ref Vpc, !Ref ExistingVpcId]
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref GuardrailsContainerPort
+          ToPort: !Ref GuardrailsContainerPort
+          SourceSecurityGroupId: !Ref GuardrailsAlbSecurityGroup
+          Description: Container port from ALB
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+          Description: All outbound (ECR pull, CloudWatch)
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-guardrails-sg'
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  GuardrailsCertificate:
+    Type: Custom::AlbCertificate
+    Condition: DeployGuardrails
+    Properties:
+      ServiceToken: !GetAtt CertGeneratorFunction.Arn
+      DomainName: !Ref GuardrailsDomainName
+      CertParameterName: !Sub '/${AWS::StackName}/guardrails-cert'
+      StackName: !Ref 'AWS::StackName'
+
+  GuardrailsAlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Condition: DeployGuardrails
+    Properties:
+      Name: !Sub '${AWS::StackName}-guardrails'
+      Scheme: internal
+      Type: application
+      SecurityGroups:
+        - !Ref GuardrailsAlbSecurityGroup
+      Subnets:
+        - !If [CreateNewPublicSubnet, !Ref PublicSubnet, !Ref ExistingPublicSubnetId]
+        - !If [CreateNewPublicSubnet2, !Ref PublicSubnet2, !Ref ExistingPublicSubnet2Id]
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-guardrails-alb'
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  GuardrailsTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: DeployGuardrails
+    Properties:
+      Name: !Sub '${AWS::StackName}-guardrails-tg'
+      Protocol: HTTP
+      Port: !Ref GuardrailsContainerPort
+      VpcId: !If [CreateNewVpc, !Ref Vpc, !Ref ExistingVpcId]
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: !Sub '${GuardrailsContainerPort}'
+      HealthCheckPath: !Ref GuardrailsHealthCheckPath
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      Matcher:
+        HttpCode: 200-499
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  GuardrailsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: DeployGuardrails
+    Properties:
+      LoadBalancerArn: !Ref GuardrailsAlb
+      Protocol: HTTPS
+      Port: 443
+      Certificates:
+        - CertificateArn: !GetAtt GuardrailsCertificate.CertificateArn
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref GuardrailsTargetGroup
+
+  GuardrailsLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Condition: DeployGuardrails
+    Properties:
+      LaunchTemplateName: !Sub '${AWS::StackName}-guardrails-lt'
+      LaunchTemplateData:
+        ImageId: !Ref GuardrailsAmiId
+        InstanceType: !Ref GuardrailsInstanceType
+        SecurityGroupIds:
+          - !Ref GuardrailsSecurityGroup
+        IamInstanceProfile:
+          Name: !Ref GuardrailsInstanceProfile
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              Encrypted: true
+              VolumeSize: 100
+              VolumeType: gp3
+        MetadataOptions:
+          HttpTokens: required
+          HttpEndpoint: enabled
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euo pipefail
+            exec > /var/log/guardrails-init.log 2>&1
+            echo "Starting guardrails container deployment..."
+            TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+            REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
+            IMAGE_URI="${GuardrailsImageUri}"
+            CONTAINER_PORT="${GuardrailsContainerPort}"
+            REGISTRY=$(echo "$IMAGE_URI" | cut -d/ -f1)
+            systemctl start docker || true
+            systemctl enable docker || true
+            aws ecr get-login-password --region "$REGION" | \
+              docker login --username AWS --password-stdin "$REGISTRY"
+            docker pull "$IMAGE_URI"
+            docker run -d --restart always --gpus all \
+              -p "$CONTAINER_PORT:$CONTAINER_PORT" \
+              --name guardrails \
+              "$IMAGE_URI"
+            echo "Guardrails container started on port $CONTAINER_PORT"
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${AWS::StackName}-guardrails'
+              - Key: Project
+                Value: !Ref Project
+              - Key: Environment
+                Value: !Ref Environment
+              - Key: ManagedBy
+                Value: CloudFormation
+
+  GuardrailsAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Condition: DeployGuardrails
+    Properties:
+      AutoScalingGroupName: !Sub '${AWS::StackName}-guardrails-asg'
+      LaunchTemplate:
+        LaunchTemplateId: !Ref GuardrailsLaunchTemplate
+        Version: !GetAtt GuardrailsLaunchTemplate.LatestVersionNumber
+      MinSize: !Ref GuardrailsMinCapacity
+      MaxSize: !Ref GuardrailsMaxCapacity
+      DesiredCapacity: !Ref GuardrailsDesiredCapacity
+      VPCZoneIdentifier:
+        - !If [CreateNewPrivateSubnet, !Ref PrivateSubnet, !Ref ExistingPrivateSubnetId]
+        - !If [CreateNewPrivateSubnet2, !Ref PrivateSubnet2, !Ref ExistingPrivateSubnet2Id]
+      TargetGroupARNs:
+        - !Ref GuardrailsTargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 600
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+          PropagateAtLaunch: false
+        - Key: Environment
+          Value: !Ref Environment
+          PropagateAtLaunch: false
+        - Key: ManagedBy
+          Value: CloudFormation
+          PropagateAtLaunch: false
 
   # ============================================================
   # Gateway ALB Certificate (auto-generated)
@@ -2227,3 +2637,23 @@ Outputs:
     Condition: DeployDlpod
     Description: DLPoD ALB DNS name
     Value: !GetAtt DlpodAlb.DNSName
+
+  GuardrailsAutoScalingGroupName:
+    Condition: DeployGuardrails
+    Description: Guardrails Auto Scaling group name
+    Value: !Ref GuardrailsAutoScalingGroup
+
+  GuardrailsAlbDnsName:
+    Condition: DeployGuardrails
+    Description: Guardrails internal ALB DNS name
+    Value: !GetAtt GuardrailsAlb.DNSName
+
+  GuardrailsHostUrl:
+    Condition: DeployGuardrails
+    Description: Guardrails host URL for AI Gateway configuration
+    Value: !Sub 'https://${GuardrailsDomainName}'
+
+  GuardrailsSecurityGroupId:
+    Condition: DeployGuardrails
+    Description: Guardrails instance security group ID
+    Value: !Ref GuardrailsSecurityGroup

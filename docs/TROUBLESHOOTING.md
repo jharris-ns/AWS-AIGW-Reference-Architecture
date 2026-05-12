@@ -144,7 +144,8 @@ Instance stuck in Pending:Wait
     |   (/aws/lambda/<stack>-activation)
     |       |
     |       +-- No log entries? --> SNS not triggering Lambda (see below)
-    |       +-- Error registering appliance? --> Check Netskope API creds
+    |       +-- "401: Unauthorized"? --> Wrong API token (see "API token rejected" below)
+    |       +-- Error registering appliance? --> Check Netskope API creds / permissions
     |       +-- "Started enrollment" logged? --> Continue below
     |
     +-- Check Step Functions execution
@@ -196,6 +197,15 @@ aws logs filter-log-events \
 ```
 
 ### Common Failures
+
+**API token rejected (401 Unauthorized)**
+
+| | |
+|---|---|
+| Symptom | Gateway instances launch and immediately get abandoned. Activation Lambda logs show `API POST /api/v2/aig/appliances -> 401: Unauthorized`. No Step Functions enrollment execution is created. The ASG enters a launch/abandon/retry loop. |
+| Cause | The `NetskopeApiToken` parameter contains the wrong credential. A common mistake is using `NETSKOPE_API_TOKEN` instead of `NETSKOPE_API_KEY` from your environment — these are different credentials. The token may also be expired or lack the required RBAC v3 permissions. |
+| Diagnose | Check the Activation Lambda logs: `aws logs tail /aws/lambda/<stack>-activation --since 30m`. Look for `401: Unauthorized` in the output. |
+| Fix | 1. Verify the token works: `curl -sf -o /dev/null -w "HTTP %{http_code}\n" -H "Netskope-Api-Token: <token>" https://<tenant>.goskope.com/api/v2/aig/appliances`. A 200 response means the token is valid. 2. Update the stack with the correct token, or delete and redeploy. See [DEPLOYMENT.md](DEPLOYMENT.md#environment-variable-mapping) for the env var to parameter mapping. |
 
 **SNS not triggering Lambda**
 

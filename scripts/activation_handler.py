@@ -127,6 +127,10 @@ def start_enrollment(instance_id, instance_ip, appliance_id, enrollment_token,
     dlp_host_url = os.environ.get('DLP_HOST_URL', '')
     if dlp_host_url:
         sfn_input['dlp_host_url'] = dlp_host_url
+    # Pass guardrails host URL if configured (triggers guardrails config after enrollment)
+    guardrails_host_url = os.environ.get('GUARDRAILS_HOST_URL', '')
+    if guardrails_host_url:
+        sfn_input['guardrails_host_url'] = guardrails_host_url
     if lifecycle_detail:
         sfn_input['lifecycle'] = {
             'hook_name': lifecycle_detail.get('LifecycleHookName', ''),

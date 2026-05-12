@@ -24,7 +24,8 @@ Before deploying, ensure the following are in place.
 
 The AI Gateway is deployed from a shared AMI provided by Netskope. This AMI must be available in your target AWS account and region.
 
-- If the AMI is not in your account, contact your Netskope representative to have it shared, or copy it from the source account using `aws ec2 copy-image`.
+- The AI Gateway AMI is currently distributed by Netskope directly. Contact your Netskope representative to have the AMI shared with your AWS account. This distribution method may change in the future (e.g., AWS Marketplace availability).
+- If the AMI has been shared to a different region, copy it to your target region using `aws ec2 copy-image`.
 - The AMI includes the AI Gateway appliance services (VAM, DMS, traffic intercept, ext-authz, RLS), SSH support for Lambda automation, and all required dependencies.
 - Pass the AMI ID as the `GatewayAmiId` parameter when deploying.
 
@@ -57,8 +58,6 @@ For more information, see:
 
 TLS certificates for both the gateway ALB and DLPoD ALB are automatically generated at stack creation by a shared cert generator Lambda. The gateway ALB certificate uses the `GatewayAlbDomainName` parameter as the Common Name (default: `aigw.internal`). No manual certificate creation is required. See [CERTIFICATE_MANAGEMENT.md](docs/CERTIFICATE_MANAGEMENT.md) for details.
 
-See [CERTIFICATE_MANAGEMENT.md](docs/CERTIFICATE_MANAGEMENT.md) for step-by-step instructions on creating and importing certificates (macOS, Linux, and Windows).
-
 ### 4. Lambda Deployment Artifacts
 
 The enrollment Lambda and its Layer must be built and uploaded to an S3 bucket in the deployment region. A script is provided that handles bucket creation, builds, and uploads:
@@ -74,7 +73,7 @@ See [DEPLOYMENT.md](docs/DEPLOYMENT.md) for manual steps and update procedures.
 If you want DLP content inspection, provide a DLPoD AMI ID (`DlpodAmiId`) and license key (`DlpodLicenseKey`) when deploying. The template conditionally deploys DLPoD as part of the stack — no separate deployment is needed.
 
 To obtain these:
-- **DLPoD AMI** — Contact your Netskope representative to have the DLPoD AMI shared with your AWS account, or copy it from the source account using `aws ec2 copy-image`.
+- **DLPoD AMI** — The DLPoD AMI is available in the [AWS Marketplace](https://aws.amazon.com/marketplace). Search for "Netskope DLP On Demand" and subscribe. After subscribing, the AMI will be available in your account for the subscribed regions.
 - **License Key** — In your Netskope tenant, navigate to **Settings > Security Cloud Platform > On-Premises Infrastructure** to generate or retrieve a DLPoD license key.
 
 ### 6. AWS Services and IAM Permissions
@@ -276,6 +275,29 @@ s3://<bucket>/
 ```
 
 The bucket must be in the **same region** as the stack. It does not need to be public — CloudFormation fetches using the caller's IAM credentials.
+
+---
+
+## Deployment Planning
+
+Before deploying, decide on these three options:
+
+### New VPC or Existing VPC?
+
+- **New VPC** (recommended for evaluation) — Leave all `Existing*` parameters empty. The template creates a VPC with public and private subnets, internet gateway, NAT gateway, route tables, and all required VPC endpoints. No network prerequisites.
+- **Existing VPC** — Provide the VPC ID and four subnet IDs (2 public for ALB, 2 private for instances). Requires a NAT gateway, DNS enabled, and no conflicting VPC endpoints. See [VPC Requirements](docs/DEVOPS.md#when-using-an-existing-vpc) for the full checklist.
+
+### With DLPoD or Without?
+
+- **Without DLPoD** — Gateway only, no inline DLP content inspection. Suitable when DLP is handled by another service or not needed. Leave `DlpodAmiId` empty.
+- **With DLPoD** — Adds a second Auto Scaling Group, private ALB, and Route 53 hosted zone for DLP inspection. Requires:
+  - DLPoD AMI from the [AWS Marketplace](https://aws.amazon.com/marketplace) (search "Netskope DLP On Demand")
+  - License key from your Netskope tenant (**Settings > Security Cloud Platform > On-Premises Infrastructure**)
+
+### Instance Type?
+
+- **m5.4xlarge** (default) — CPU-only, supports standard AI guardrails. Sufficient for most deployments.
+- **GPU instances** (g4dn, g5) — Required for advanced AI guardrails that use CUDA/NVIDIA acceleration. You must update the `AllowedValues` constraint in the template to permit GPU instance types.
 
 ---
 
@@ -490,6 +512,22 @@ When `DlpodAmiId` is provided, the template conditionally deploys DLPoD as part 
 4. Instance moves to `InService`
 
 The AI Gateway is automatically configured to use the DLPoD service after its own enrollment completes. The AIG enrollment state machine waits for the DLPoD TLS certificate to appear in SSM Parameter Store, then navigates the AIG TUI to configure the DLP service certificate and host URL (`DlpDomainName`).
+
+---
+
+## Glossary
+
+Terms used throughout this documentation:
+
+| Term | Definition |
+|------|-----------|
+| **Appliance ID** | Unique identifier assigned when a gateway registers with the Netskope tenant API. Stored in SSM Parameter Store (`/aig/{stack}/{instance-id}/appliance-id`); used for deregistration when an instance is terminated. |
+| **Enrollment token** | One-time token generated by the Netskope API during appliance registration. Passed to the gateway over SSH during TUI enrollment. Valid for approximately 30 days. |
+| **Pre-enrollment install** | Background provisioning process (~10-15 minutes) that runs on a fresh gateway instance after boot. The TUI displays progress during this phase. Enrollment cannot proceed until it completes. |
+| **Tethering** | The process by which a DLPoD appliance connects to the Netskope management plane. Analogous to gateway enrollment — the appliance registers, receives configuration, and begins serving DLP requests. |
+| **aig-cli (TUI)** | Terminal-based menu interface on gateway instances. The `nsadmin` SSH user drops directly into this menu on login. The enrollment Lambda automates navigation of this interface using paramiko (SSH) and pyte (terminal emulation). |
+| **nsadmin** | Default SSH user on both gateway and DLPoD appliances. On gateways, login opens the aig-cli TUI. On DLPoD instances, login opens a standard CLI. |
+| **Management plane** | Netskope's cloud-hosted control plane. Appliances register with it to receive security policies, configuration updates, and DLP profiles. |
 
 ---
 

@@ -168,6 +168,74 @@ On termination, the lifecycle hook completes with `CONTINUE`. DLPoD instances ar
 
 ---
 
+## Verifying a Successful Deployment
+
+After running `create-stack`, use these checks to confirm the deployment is healthy.
+
+### Expected Timeline
+
+| Phase | Duration | What's happening |
+|-------|----------|-----------------|
+| Stack creation (AWS resources) | ~5 min | VPC, ALB, ASG, Lambda, Step Functions, etc. |
+| Instance boot + SSH ready | ~3 min | EC2 instance starts, services initialize, SSH becomes available |
+| Pre-enrollment install | ~10-15 min | Gateway provisions internal services (progress visible in TUI) |
+| Enrollment + DLP config | ~2-3 min | Token submitted, enrollment completes, DLP configured (if DLPoD enabled) |
+| **Total: launch to traffic-ready** | **~20-25 min** | Instance reaches `InService` and ALB health checks pass |
+
+### What to Check
+
+A healthy deployment shows:
+
+1. **Stack status** is `CREATE_COMPLETE`
+2. **ASG instances** are in `InService` (not stuck in `Pending:Wait`)
+3. **Step Functions executions** show `SUCCEEDED`
+4. **ALB target group** shows healthy targets
+
+### Verification Commands
+
+```bash
+# Stack status
+aws cloudformation describe-stacks --stack-name <stack> \
+  --query 'Stacks[0].StackStatus' --output text
+
+# ASG instance states (all should show InService)
+aws autoscaling describe-auto-scaling-groups \
+  --auto-scaling-group-names <stack>-asg \
+  --query 'AutoScalingGroups[0].Instances[*].[InstanceId,LifecycleState]' \
+  --output table
+
+# Step Functions enrollment executions (all should show SUCCEEDED)
+aws stepfunctions list-executions \
+  --state-machine-arn arn:aws:states:<region>:<account>:stateMachine:<stack>-enrollment \
+  --query 'executions[*].[name,status]' --output table
+
+# ALB target health (all should show healthy)
+# Get the target group ARN from stack outputs or describe-target-groups
+aws elbv2 describe-target-health \
+  --target-group-arn <tg-arn> \
+  --query 'TargetHealthDescriptions[*].[Target.Id,TargetHealth.State]' \
+  --output table
+```
+
+If DLPoD is deployed, also check:
+
+```bash
+# DLPoD ASG instance states
+aws autoscaling describe-auto-scaling-groups \
+  --auto-scaling-group-names <stack>-dlpod-asg \
+  --query 'AutoScalingGroups[0].Instances[*].[InstanceId,LifecycleState]' \
+  --output table
+
+# DLPoD tethering executions
+aws stepfunctions list-executions \
+  --state-machine-arn arn:aws:states:<region>:<account>:stateMachine:<stack>-dlpod-tethering \
+  --query 'executions[*].[name,status]' --output table
+```
+
+If any instance is stuck in `Pending:Wait` after 20 minutes, see the [Troubleshooting Guide](TROUBLESHOOTING.md#troubleshooting-enrollment) for the diagnostic decision tree.
+
+---
+
 ## Scaling Operations
 
 ### Scale Out (Add Instances)
@@ -478,20 +546,24 @@ The template automatically creates the VPC with:
 | `NetskopeApiToken` | Yes | - | API token (NoEcho, stored in Secrets Manager) |
 | `GatewayAlbDomainName` | No | `aigw.internal` | CN for auto-generated gateway ALB certificate |
 | `ExistingVpcId` | No | '' | Existing VPC ID; empty creates a new VPC |
-| `ExistingSubnetId` | No | '' | Existing subnet ID (AZ 1); empty creates new |
-| `ExistingSubnet2Id` | No | '' | Existing subnet ID (AZ 2); empty creates new |
+| `ExistingPublicSubnetId` | No | '' | Existing public subnet (AZ 1) for ALB; empty creates new |
+| `ExistingPublicSubnet2Id` | No | '' | Existing public subnet (AZ 2) for ALB; empty creates new |
+| `ExistingPrivateSubnetId` | No | '' | Existing private subnet (AZ 1) for instances; empty creates new |
+| `ExistingPrivateSubnet2Id` | No | '' | Existing private subnet (AZ 2) for instances; empty creates new |
 | `VpcCidr` | No | 10.0.0.0/16 | CIDR for new VPC |
-| `PublicSubnetCidr` | No | 10.0.1.0/24 | CIDR for new subnet 1 |
-| `PublicSubnet2Cidr` | No | 10.0.2.0/24 | CIDR for new subnet 2 |
+| `PublicSubnetCidr` | No | 10.0.1.0/24 | CIDR for new public subnet 1 |
+| `PublicSubnet2Cidr` | No | 10.0.2.0/24 | CIDR for new public subnet 2 |
+| `PrivateSubnetCidr` | No | 10.0.10.0/24 | CIDR for new private subnet 1 |
+| `PrivateSubnet2Cidr` | No | 10.0.11.0/24 | CIDR for new private subnet 2 |
 | `GatewayAmiId` | No | ami-0010b83013995a493 | Netskope AI Gateway AMI |
 | `InstanceType` | No | m5.4xlarge | Instance type (16 vCPU, 64 GiB minimum) |
 | `LambdaCodeBucket` | Yes | - | S3 bucket containing Lambda package and Layer |
 | `LambdaCodeKey` | No | lambda-step-function.zip | S3 key for enrollment Lambda package |
+| `ActivationLambdaCodeKey` | No | lambda-activation.zip | S3 key for activation Lambda package |
 | `LambdaLayerKey` | No | layers/pexpect-layer.zip | S3 key for paramiko/pyte Lambda Layer |
 | `MinCapacity` | No | 1 | ASG minimum instances |
 | `MaxCapacity` | No | 3 | ASG maximum instances |
 | `DesiredCapacity` | No | 1 | ASG desired instances |
-| `GatewayAlbDomainName` | No | '' | Custom domain name for the gateway ALB |
 | `DlpodAmiId` | No | '' | DLPoD AMI ID; empty disables all DLPoD resources |
 | `DlpodInstanceType` | No | m5.4xlarge | Instance type for DLPoD instances |
 | `DlpodLicenseKey` | No | '' | License key for DLPoD appliances |

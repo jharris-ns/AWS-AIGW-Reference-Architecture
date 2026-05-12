@@ -9,8 +9,49 @@ This guide covers building and uploading the deployment artifacts, and deploying
 - AWS CLI configured with credentials that have the permissions listed in the [README](../README.md)
 - Docker or Podman (for building the Lambda Layer on the correct architecture)
 - Netskope tenant URL and RBAC v3 API token (see [README](../README.md#2-netskope-tenant-credentials))
-- ACM certificate ARN (see [Certificate Management](CERTIFICATE_MANAGEMENT.md))
 - AI Gateway AMI ID in the target region
+
+---
+
+## Preflight Checks
+
+Run these checks before building artifacts or deploying to catch common blockers early:
+
+```bash
+# Verify AWS identity and target region
+aws sts get-caller-identity
+aws configure get region
+
+# Verify the Gateway AMI is accessible in your account/region
+aws ec2 describe-images --image-ids <gateway-ami-id> \
+  --query 'Images[0].[ImageId,Name,State]' --output table
+
+# Verify the DLPoD AMI (if deploying DLPoD)
+aws ec2 describe-images --image-ids <dlpod-ami-id> \
+  --query 'Images[0].[ImageId,Name,State]' --output table
+
+# Verify Netskope API connectivity
+curl -sf -o /dev/null -w "HTTP %{http_code}\n" \
+  -H "Netskope-Api-Token: $NETSKOPE_API_TOKEN" \
+  https://<tenant>.goskope.com/api/v2/aig/appliances
+
+# Verify Docker/Podman (needed for Lambda Layer build)
+podman --version 2>/dev/null || docker --version
+```
+
+If the AMI check returns "does not exist," the AMI hasn't been shared with your account or isn't available in the target region. See the [README prerequisites](../README.md#1-netskope-ai-gateway-ami) for how to obtain each AMI.
+
+### Environment Variable Mapping
+
+If you use Netskope environment variables for API access, map them to template parameters as follows:
+
+| Environment Variable | Template Parameter | Transform |
+|---------------------|-------------------|-----------|
+| `NETSKOPE_SERVER_URL` | `NetskopeTenantUrl` | Strip the `/api/v2` suffix — the template appends the API path automatically |
+| `NETSKOPE_API_TOKEN` | `NetskopeApiToken` | Use as-is (RBAC v3 service account token) |
+| `AWS_DEFAULT_REGION` | `--region` flag | Must match the S3 artifact bucket region |
+
+> **Note:** `NETSKOPE_API_KEY` is a different credential (used for legacy REST API v2 authentication) and is **not** used by this template. The template requires an RBAC v3 service account token passed as `NetskopeApiToken`.
 
 ---
 

@@ -1,27 +1,54 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   DLPoD tethering and ALB test. Deploys a DLP On Demand appliance behind
-  a private ALB with a self-signed certificate, plus Lambda automation
-  for CLI-driven tethering via Step Functions.
+  an internet-facing ALB with a self-signed certificate, plus Lambda automation
+  for CLI-driven tethering via Step Functions. ALB access is restricted to
+  AllowedIngressCidr via security group.
 
 Parameters:
-  VpcId:
-    Type: AWS::EC2::VPC::Id
-    Description: VPC to deploy into
+  VpcCidr:
+    Type: String
+    Description: CIDR block for the new VPC.
+    Default: '10.0.0.0/16'
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    ConstraintDescription: Must be a valid IPv4 CIDR block.
 
-  AlbSubnetIds:
-    Type: List<AWS::EC2::Subnet::Id>
-    Description: >
-      Two subnets in different AZs for the internal ALB. These can be
-      public or private subnets — the ALB uses internal scheme regardless.
-      Each subnet must have at least 8 free IPs (/24 or larger recommended).
+  PublicSubnet1Cidr:
+    Type: String
+    Description: CIDR for the first public subnet (AZ 1) — used by the internet-facing ALB.
+    Default: '10.0.0.0/24'
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    ConstraintDescription: Must be a valid IPv4 CIDR block.
 
-  PrivateSubnetIds:
-    Type: List<AWS::EC2::Subnet::Id>
+  PublicSubnet2Cidr:
+    Type: String
+    Description: CIDR for the second public subnet (AZ 2) — used by the internet-facing ALB.
+    Default: '10.0.1.0/24'
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    ConstraintDescription: Must be a valid IPv4 CIDR block.
+
+  PrivateSubnet1Cidr:
+    Type: String
+    Description: CIDR for the first private subnet (AZ 1) — used by the DLPoD instance and Lambda.
+    Default: '10.0.10.0/24'
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    ConstraintDescription: Must be a valid IPv4 CIDR block.
+
+  PrivateSubnet2Cidr:
+    Type: String
+    Description: CIDR for the second private subnet (AZ 2) — used by Lambda.
+    Default: '10.0.11.0/24'
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    ConstraintDescription: Must be a valid IPv4 CIDR block.
+
+  AllowedIngressCidr:
+    Type: String
     Description: >
-      One or two private subnets with NAT gateway for outbound. Used for
-      the DLPoD instance and Lambda functions. First subnet is used for
-      the DLPoD instance.
+      Source CIDR permitted to reach the ALB on port 443. Restrict to your
+      office or VPN egress IP(s) to limit exposure.
+    Default: '0.0.0.0/0'
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    ConstraintDescription: Must be a valid IPv4 CIDR block.
 
   LambdaCodeBucket:
     Type: String
@@ -82,9 +109,12 @@ Metadata:
       - Label:
           default: Network Configuration
         Parameters:
-          - VpcId
-          - AlbSubnetIds
-          - PrivateSubnetIds
+          - VpcCidr
+          - PublicSubnet1Cidr
+          - PublicSubnet2Cidr
+          - PrivateSubnet1Cidr
+          - PrivateSubnet2Cidr
+          - AllowedIngressCidr
           - DnsServer
       - Label:
           default: DLPoD Appliance
@@ -118,6 +148,158 @@ Resources:
         }
 
   # =========================================================
+  # VPC
+  # =========================================================
+
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-vpc'
+
+  # =========================================================
+  # Internet Gateway + Public Subnets for Internet-Facing ALB
+  # =========================================================
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-igw'
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-1'
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-2'
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-rt'
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # =========================================================
+  # NAT Gateway + Private Subnets for DLPoD and Lambda
+  # =========================================================
+
+  NatGatewayEip:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-nat-eip'
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGatewayEip.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-nat'
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-1'
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-2'
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-rt'
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # =========================================================
   # DLPoD Certificate Parameter (SSM)
   # =========================================================
 
@@ -137,7 +319,7 @@ Resources:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupDescription: Lambda for DLPoD CLI automation
-      VpcId: !Ref VpcId
+      VpcId: !Ref Vpc
       SecurityGroupEgress:
         - IpProtocol: '-1'
           CidrIp: '0.0.0.0/0'
@@ -149,24 +331,14 @@ Resources:
   AlbSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Private ALB for DLPoD service
-      VpcId: !Ref VpcId
+      GroupDescription: Internet-facing ALB for DLPoD service - HTTPS restricted by AllowedIngressCidr
+      VpcId: !Ref Vpc
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 443
           ToPort: 443
-          CidrIp: '10.0.0.0/8'
-          Description: HTTPS from RFC1918 10.x
-        - IpProtocol: tcp
-          FromPort: 443
-          ToPort: 443
-          CidrIp: '172.16.0.0/12'
-          Description: HTTPS from RFC1918 172.x
-        - IpProtocol: tcp
-          FromPort: 443
-          ToPort: 443
-          CidrIp: '192.168.0.0/16'
-          Description: HTTPS from RFC1918 192.x
+          CidrIp: !Ref AllowedIngressCidr
+          Description: HTTPS from allowed source CIDR
       SecurityGroupEgress:
         - IpProtocol: tcp
           FromPort: 443
@@ -181,7 +353,7 @@ Resources:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupDescription: DLPoD appliance
-      VpcId: !Ref VpcId
+      VpcId: !Ref Vpc
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 22
@@ -215,14 +387,13 @@ Resources:
     Properties:
       Name: aigw.internal
       VPCs:
-        - VPCId: !Ref VpcId
+        - VPCId: !Ref Vpc
           VPCRegion: !Ref 'AWS::Region'
       HostedZoneConfig:
         Comment: !Sub 'Private zone for ${AWS::StackName} DLPoD ALB'
 
   DlpodDnsRecord:
     Type: AWS::Route53::RecordSet
-    DependsOn: DlpodAlb
     Properties:
       HostedZoneId: !Ref PrivateHostedZone
       Name: !Ref DlpDomainName
@@ -332,11 +503,13 @@ Resources:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Properties:
       Name: !Sub '${AWS::StackName}-dlpod'
-      Scheme: internal
+      Scheme: internet-facing
       Type: application
       SecurityGroups:
         - !Ref AlbSecurityGroup
-      Subnets: !Ref AlbSubnetIds
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
       Tags:
         - Key: Name
           Value: !Sub '${AWS::StackName}-dlpod-alb'
@@ -347,7 +520,7 @@ Resources:
       Name: !Sub '${AWS::StackName}-dlpod-tg'
       Protocol: HTTPS
       Port: 443
-      VpcId: !Ref VpcId
+      VpcId: !Ref Vpc
       TargetType: instance
       Targets:
         - Id: !Ref DlpodInstance
@@ -387,7 +560,7 @@ Resources:
     Properties:
       ImageId: !Ref DlpodAmiId
       InstanceType: !Ref DlpodInstanceType
-      SubnetId: !Select [0, !Ref PrivateSubnetIds]
+      SubnetId: !Ref PrivateSubnet1
       SecurityGroupIds:
         - !Ref DlpodSecurityGroup
       BlockDeviceMappings:
@@ -473,7 +646,9 @@ Resources:
       VpcConfig:
         SecurityGroupIds:
           - !Ref LambdaSecurityGroup
-        SubnetIds: !Ref PrivateSubnetIds
+        SubnetIds:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
       Environment:
         Variables:
           DLPOD_SECRET_ARN: !Ref DlpodCredentialsSecret
@@ -522,7 +697,8 @@ Resources:
               "Resource": "${DlpodLambdaFunction.Arn}",
               "Parameters": {
                 "action": "dlpod_check_ssh",
-                "dlpod_ip.$": "$.dlpod_ip"
+                "dlpod_ip.$": "$.dlpod_ip",
+                "password.$": "$.password"
               },
               "ResultPath": "$.ssh_check",
               "Next": "IsDlpodSSHReady",
@@ -551,7 +727,8 @@ Resources:
               "Resource": "${DlpodLambdaFunction.Arn}",
               "Parameters": {
                 "action": "dlpod_change_password",
-                "dlpod_ip.$": "$.dlpod_ip"
+                "dlpod_ip.$": "$.dlpod_ip",
+                "password.$": "$.password"
               },
               "ResultPath": "$.password_result",
               "Next": "SetDNS",
@@ -567,7 +744,8 @@ Resources:
               "Parameters": {
                 "action": "dlpod_set_dns",
                 "dlpod_ip.$": "$.dlpod_ip",
-                "dns_primary.$": "$.dns_primary"
+                "dns_primary.$": "$.dns_primary",
+                "password.$": "$.password_result.password"
               },
               "ResultPath": "$.dns_result",
               "Next": "SetLicenseKey",
@@ -582,7 +760,8 @@ Resources:
               "Resource": "${DlpodLambdaFunction.Arn}",
               "Parameters": {
                 "action": "dlpod_set_license",
-                "dlpod_ip.$": "$.dlpod_ip"
+                "dlpod_ip.$": "$.dlpod_ip",
+                "password.$": "$.password_result.password"
               },
               "ResultPath": "$.license_result",
               "Next": "WaitForTetheringInit",
@@ -602,7 +781,8 @@ Resources:
               "Resource": "${DlpodLambdaFunction.Arn}",
               "Parameters": {
                 "action": "dlpod_check_tethering",
-                "dlpod_ip.$": "$.dlpod_ip"
+                "dlpod_ip.$": "$.dlpod_ip",
+                "password.$": "$.password_result.password"
               },
               "ResultPath": "$.tethering",
               "Next": "IsTetheringComplete",
@@ -659,10 +839,11 @@ Outputs:
     Value: !Ref PrivateHostedZone
 
   StateMachineInput:
-    Description: Full tethering state machine execution input
+    Description: Full tethering state machine execution input (use nsappliance password for fresh instances)
     Value: !Sub |
       {
         "dlpod_ip": "${DlpodInstance.PrivateIp}",
         "dlpod_hostname": "${DlpDomainName}",
-        "dns_primary": "${DnsServer}"
+        "dns_primary": "${DnsServer}",
+        "password": "nsappliance"
       }

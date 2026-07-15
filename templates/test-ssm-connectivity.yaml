@@ -1,0 +1,234 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Minimal SSM connectivity test — launches one AIG gateway instance in a new VPC
+  with AmazonSSMManagedInstanceCore attached. Check Fleet Manager / Session Manager
+  for the instance to confirm the SSM agent is running.
+
+Parameters:
+  GatewayAmiId:
+    Type: AWS::EC2::Image::Id
+    Default: ami-077c245171c8b4942
+    Description: AIG Gateway AMI to test (default is AIG Gateway v1.3.340 us-west-1)
+
+  InstanceType:
+    Type: String
+    Default: t3.medium
+    Description: Instance type for the test instance
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: SSH key pair (needed only if you want SSH fallback access)
+
+Resources:
+
+  # ── VPC ────────────────────────────────────────────────────────────────────
+
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.99.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-vpc'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-igw'
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.99.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public'
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-rt-public'
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRTAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # ── Security Group ─────────────────────────────────────────────────────────
+
+  InstanceSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SSM test - outbound only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: SSH for log inspection
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-sg'
+
+  # ── IAM role with SSM managed policy ──────────────────────────────────────
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-instance-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-instance-role'
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${AWS::StackName}-instance-profile'
+      Roles:
+        - !Ref InstanceRole
+
+  # ── EC2 instance ───────────────────────────────────────────────────────────
+
+  TestInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref GatewayAmiId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref InstanceSg
+      IamInstanceProfile: !Ref InstanceProfile
+      KeyName: !Ref KeyPairName
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          set -e
+          exec > /var/log/ssm-install.log 2>&1
+
+          echo "=== SSM Agent Install ==="
+          echo "Date: $(date -u)"
+
+          # Detect OS from /etc/os-release
+          . /etc/os-release 2>/dev/null || true
+          OS_ID=$(echo "${ID:-unknown}" | tr '[:upper:]' '[:lower:]')
+          OS_LIKE=$(echo "${ID_LIKE:-}" | tr '[:upper:]' '[:lower:]')
+          ARCH=$(uname -m)
+          echo "OS_ID=$OS_ID  OS_LIKE=$OS_LIKE  ARCH=$ARCH"
+
+          install_ssm_debian() {
+            echo "Installing via apt/deb (Ubuntu/Debian)..."
+            # Prefer snap if available; fall back to direct deb download
+            if command -v snap >/dev/null 2>&1; then
+              snap install amazon-ssm-agent --classic
+              snap start amazon-ssm-agent
+            else
+              if [ "$ARCH" = "x86_64" ]; then
+                PKG_URL="https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/debian_amd64/amazon-ssm-agent.deb"
+              else
+                PKG_URL="https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/debian_arm64/amazon-ssm-agent.deb"
+              fi
+              apt-get update -y -q
+              apt-get install -y -q wget
+              wget -q -O /tmp/amazon-ssm-agent.deb "$PKG_URL"
+              dpkg -i /tmp/amazon-ssm-agent.deb
+              systemctl enable amazon-ssm-agent
+              systemctl start amazon-ssm-agent
+            fi
+          }
+
+          install_ssm_rpm() {
+            echo "Installing via yum/rpm (Amazon Linux / RHEL / CentOS)..."
+            if [ "$ARCH" = "x86_64" ]; then
+              PKG_URL="https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/linux_amd64/amazon-ssm-agent.rpm"
+            else
+              PKG_URL="https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/linux_arm64/amazon-ssm-agent.rpm"
+            fi
+            yum install -y "$PKG_URL" 2>/dev/null || \
+              yum install -y amazon-ssm-agent 2>/dev/null || \
+              dnf install -y amazon-ssm-agent
+            systemctl enable amazon-ssm-agent
+            systemctl start amazon-ssm-agent
+          }
+
+          # Route by distro family
+          case "$OS_ID" in
+            ubuntu|debian)
+              install_ssm_debian ;;
+            amzn|"amazon linux")
+              install_ssm_rpm ;;
+            rhel|centos|fedora|ol)
+              install_ssm_rpm ;;
+            *)
+              # Fallback: check for dpkg or rpm
+              if command -v dpkg >/dev/null 2>&1; then
+                echo "Unknown OS but dpkg found — trying debian path"
+                install_ssm_debian
+              elif command -v rpm >/dev/null 2>&1; then
+                echo "Unknown OS but rpm found — trying rpm path"
+                install_ssm_rpm
+              else
+                echo "ERROR: Cannot determine package manager for OS_ID=$OS_ID"
+                exit 1
+              fi
+              ;;
+          esac
+
+          echo "=== Done. Checking agent status ==="
+          systemctl status amazon-ssm-agent 2>/dev/null || \
+            snap services amazon-ssm-agent 2>/dev/null || \
+            echo "Status check inconclusive"
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-test'
+
+Outputs:
+  InstanceId:
+    Description: Instance ID — look this up in Systems Manager > Fleet Manager
+    Value: !Ref TestInstance
+
+  CheckCommand:
+    Description: CLI command to check SSM registration (run after ~2 min)
+    Value: !Sub >-
+      aws ssm describe-instance-information
+      --filters Key=InstanceIds,Values=${TestInstance}
+      --region ${AWS::Region}
+      --query "InstanceInformationList[0].{Status:PingStatus,Agent:AgentVersion,Platform:PlatformName}"
+      --output table

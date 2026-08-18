@@ -5,6 +5,13 @@ Description: >
   automated enrollment and deregistration.
 
 Metadata:
+  cfn-lint:
+    config:
+      ignore_checks:
+        # W2506: DlpodAmiId and GuardrailsAmiId must be Type: String with Default: ''
+        # so they can be left empty to skip optional features. AWS::EC2::Image::Id
+        # rejects empty strings, making it incompatible with optional AMI parameters.
+        - W2506
   AWS::CloudFormation::Interface:
     ParameterGroups:
       - Label:
@@ -470,7 +477,7 @@ Resources:
     Type: AWS::EC2::Subnet
     Condition: CreateNewPublicSubnet
     Properties:
-      VpcId: !Ref Vpc
+      VpcId: !If [CreateNewVpc, !Ref Vpc, !Ref ExistingVpcId]
       CidrBlock: !Ref PublicSubnetCidr
       AvailabilityZone: !Select [0, !GetAZs '']
       MapPublicIpOnLaunch: false
@@ -512,14 +519,14 @@ Resources:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Condition: CreateNewVpc
     Properties:
-      SubnetId: !Ref PublicSubnet
+      SubnetId: !If [CreateNewPublicSubnet, !Ref PublicSubnet, !Ref ExistingPublicSubnetId]
       RouteTableId: !Ref PublicRouteTable
 
   PublicSubnet2:
     Type: AWS::EC2::Subnet
     Condition: CreateNewPublicSubnet2
     Properties:
-      VpcId: !Ref Vpc
+      VpcId: !If [CreateNewVpc, !Ref Vpc, !Ref ExistingVpcId]
       CidrBlock: !Ref PublicSubnet2Cidr
       AvailabilityZone: !Select [1, !GetAZs '']
       MapPublicIpOnLaunch: true
@@ -564,7 +571,7 @@ Resources:
     Condition: CreateNewVpc
     Properties:
       AllocationId: !GetAtt NatGatewayEip.AllocationId
-      SubnetId: !Ref PublicSubnet
+      SubnetId: !If [CreateNewPublicSubnet, !Ref PublicSubnet, !Ref ExistingPublicSubnetId]
       Tags:
         - Key: Name
           Value: !Sub '${AWS::StackName}-nat'
@@ -583,7 +590,7 @@ Resources:
     Type: AWS::EC2::Subnet
     Condition: CreateNewPrivateSubnet
     Properties:
-      VpcId: !Ref Vpc
+      VpcId: !If [CreateNewVpc, !Ref Vpc, !Ref ExistingVpcId]
       CidrBlock: !Ref PrivateSubnetCidr
       AvailabilityZone: !Select [0, !GetAZs '']
       MapPublicIpOnLaunch: false
@@ -601,7 +608,7 @@ Resources:
     Type: AWS::EC2::Subnet
     Condition: CreateNewPrivateSubnet2
     Properties:
-      VpcId: !Ref Vpc
+      VpcId: !If [CreateNewVpc, !Ref Vpc, !Ref ExistingVpcId]
       CidrBlock: !Ref PrivateSubnet2Cidr
       AvailabilityZone: !Select [1, !GetAZs '']
       MapPublicIpOnLaunch: false
@@ -633,7 +640,6 @@ Resources:
   PrivateDefaultRoute:
     Type: AWS::EC2::Route
     Condition: CreateNewVpc
-    DependsOn: NatGateway
     Properties:
       RouteTableId: !Ref PrivateRouteTable
       DestinationCidrBlock: '0.0.0.0/0'
@@ -2286,6 +2292,16 @@ Resources:
   GuardrailsLaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
     Condition: DeployGuardrails
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks:
+            # W1030: GuardrailsAmiId is Type: String (not AWS::EC2::Image::Id) because
+            # it allows an empty default to make Guardrails deployment optional. This
+            # resource is only created when DeployGuardrails is true, which requires
+            # GuardrailsImageUri to be non-empty — at that point GuardrailsAmiId is
+            # also expected to be a valid AMI ID.
+            - W1030
     Properties:
       LaunchTemplateName: !Sub '${AWS::StackName}-guardrails-lt'
       LaunchTemplateData:

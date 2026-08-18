@@ -1,0 +1,1010 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AIG gateway — ASG across two AZs, native Secrets Manager bootstrap, step scaling.
+  Lifecycle hook Lambda registers the appliance and writes the enrollment token immediately
+  on launch (no Step Functions). An Application Load Balancer HTTPS health check on port 443
+  gates when the instance enters the InService pool (Option A health-check gating).
+  Step scaling adds one instance at a time to avoid concurrent bootstrap secret races.
+  Deploys into an existing VPC, or creates a new VPC with public/private subnets and NAT.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Netskope Tenant
+        Parameters: [NetskopeTenantUrl, NetskopeApiToken]
+      - Label:
+          default: Gateway Instance
+        Parameters: [GatewayAmiId, InstanceType]
+      - Label:
+          default: Scaling
+        Parameters: [MinSize, MaxSize, ScaleOutCpuThreshold]
+      - Label:
+          default: Load Balancer
+        Parameters: [AcmCertificateArn]
+      - Label:
+          default: Existing VPC (leave all empty to create a new VPC)
+        Parameters: [ExistingVpcId, ExistingPublicSubnetId, ExistingPublicSubnet2Id,
+                     ExistingPrivateSubnetId, ExistingPrivateSubnet2Id]
+      - Label:
+          default: New VPC CIDRs (used only when creating a new VPC)
+        Parameters: [VpcCidr, PublicSubnetCidr, PublicSubnet2Cidr,
+                     PrivateSubnetCidr, PrivateSubnet2Cidr]
+      - Label:
+          default: Tagging
+        Parameters: [Project, Environment]
+    ParameterLabels:
+      ExistingVpcId:
+        default: Existing VPC ID
+      ExistingPublicSubnetId:
+        default: Existing Public Subnet ID (AZ 1)
+      ExistingPublicSubnet2Id:
+        default: Existing Public Subnet ID (AZ 2)
+      ExistingPrivateSubnetId:
+        default: Existing Private Subnet ID (AZ 1)
+      ExistingPrivateSubnet2Id:
+        default: Existing Private Subnet ID (AZ 2)
+      VpcCidr:
+        default: New VPC CIDR
+      PublicSubnetCidr:
+        default: New Public Subnet CIDR (AZ 1)
+      PublicSubnet2Cidr:
+        default: New Public Subnet CIDR (AZ 2)
+      PrivateSubnetCidr:
+        default: New Private Subnet CIDR (AZ 1)
+      PrivateSubnet2Cidr:
+        default: New Private Subnet CIDR (AZ 2)
+
+Parameters:
+  NetskopeTenantUrl:
+    Type: String
+    Description: Netskope tenant URL (e.g., https://tenant.goskope.com)
+    AllowedPattern: 'https://.+'
+
+  NetskopeApiToken:
+    Type: String
+    NoEcho: true
+    Description: Netskope API token for appliance registration.
+
+  GatewayAmiId:
+    Type: AWS::EC2::Image::Id
+    Default: ami-0a66805d7fb085df4
+    Description: >
+      AIG appliance AMI ID (requires AIG 1.7 or later for native bootstrap).
+      Default is AIG Gateway v1.7.54 in us-west-1 — override for other regions.
+      Obtain region-specific AMI IDs from Netskope support or the AWS Marketplace listing.
+
+  InstanceType:
+    Type: String
+    Default: m5.4xlarge
+    AllowedValues: [m5.4xlarge, m6i.4xlarge, c5.4xlarge]
+    Description: EC2 instance type (minimum 16 vCPU, 64 GiB RAM).
+
+  MinSize:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    Description: Minimum number of gateway instances.
+
+  MaxSize:
+    Type: Number
+    Default: 4
+    MinValue: 1
+    Description: >
+      Maximum number of gateway instances. The step scaling policy adds one instance
+      per alarm breach, ensuring the bootstrap secret is not overwritten mid-flight
+      by a concurrent launch.
+
+  ScaleOutCpuThreshold:
+    Type: Number
+    Default: 70
+    MinValue: 1
+    MaxValue: 99
+    Description: >
+      Average CPU utilisation (%) across the ASG that triggers a scale-out of +1 instance.
+      Evaluated over two consecutive 5-minute periods before firing.
+
+  AcmCertificateArn:
+    Type: String
+    Description: ACM certificate ARN for the ALB HTTPS listener (must be in the same region).
+
+  # ---- Existing VPC (all empty = create new VPC) ----
+
+  ExistingVpcId:
+    Type: String
+    Default: ''
+    AllowedPattern: '^(vpc-[a-z0-9]+)?$'
+    ConstraintDescription: Must be a valid VPC ID (vpc-xxx) or empty to create a new VPC.
+    Description: Existing VPC ID. Leave empty to create a new VPC.
+
+  ExistingPublicSubnetId:
+    Type: String
+    Default: ''
+    AllowedPattern: '^(subnet-[a-z0-9]+)?$'
+    ConstraintDescription: Must be a valid subnet ID (subnet-xxx) or empty.
+    Description: Existing public subnet AZ 1 for the ALB. Leave empty to create new.
+
+  ExistingPublicSubnet2Id:
+    Type: String
+    Default: ''
+    AllowedPattern: '^(subnet-[a-z0-9]+)?$'
+    ConstraintDescription: Must be a valid subnet ID (subnet-xxx) or empty.
+    Description: Existing public subnet AZ 2 for the ALB. Leave empty to create new.
+
+  ExistingPrivateSubnetId:
+    Type: String
+    Default: ''
+    AllowedPattern: '^(subnet-[a-z0-9]+)?$'
+    ConstraintDescription: Must be a valid subnet ID (subnet-xxx) or empty.
+    Description: Existing private subnet AZ 1 for gateway instances. Leave empty to create new.
+
+  ExistingPrivateSubnet2Id:
+    Type: String
+    Default: ''
+    AllowedPattern: '^(subnet-[a-z0-9]+)?$'
+    ConstraintDescription: Must be a valid subnet ID (subnet-xxx) or empty.
+    Description: Existing private subnet AZ 2 for gateway instances. Leave empty to create new.
+
+  # ---- New VPC CIDRs (ignored when existing VPC is supplied) ----
+
+  VpcCidr:
+    Type: String
+    Default: '10.0.0.0/16'
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    Description: CIDR block for a new VPC.
+
+  PublicSubnetCidr:
+    Type: String
+    Default: '10.0.1.0/24'
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    Description: CIDR for new public subnet AZ 1 (ALB).
+
+  PublicSubnet2Cidr:
+    Type: String
+    Default: '10.0.2.0/24'
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    Description: CIDR for new public subnet AZ 2 (ALB).
+
+  PrivateSubnetCidr:
+    Type: String
+    Default: '10.0.10.0/24'
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    Description: CIDR for new private subnet AZ 1 (gateway instances).
+
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: '10.0.11.0/24'
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    Description: CIDR for new private subnet AZ 2 (gateway instances).
+
+  Project:
+    Type: String
+    Description: Project name tag.
+    AllowedPattern: '^[a-z0-9-]+$'
+
+  Environment:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment tag.
+
+Conditions:
+  CreateNewVpc:           !Equals [!Ref ExistingVpcId, '']
+  CreateNewPublicSubnet:  !Equals [!Ref ExistingPublicSubnetId, '']
+  CreateNewPublicSubnet2: !Equals [!Ref ExistingPublicSubnet2Id, '']
+  CreateNewPrivateSubnet: !Equals [!Ref ExistingPrivateSubnetId, '']
+  CreateNewPrivateSubnet2: !Equals [!Ref ExistingPrivateSubnet2Id, '']
+
+Resources:
+
+  # ============================================================
+  # VPC (created only when ExistingVpcId is empty)
+  # ============================================================
+
+  Vpc:
+    Type: AWS::EC2::VPC
+    Condition: CreateNewVpc
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-vpc'
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Condition: CreateNewVpc
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-igw'
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Condition: CreateNewVpc
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref Vpc
+
+  # ============================================================
+  # Public subnets (ALB)
+  # ============================================================
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Condition: CreateNewPublicSubnet
+    Properties:
+      VpcId: !If [CreateNewVpc, !Ref Vpc, !Ref ExistingVpcId]
+      CidrBlock: !Ref PublicSubnetCidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-1'
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Condition: CreateNewPublicSubnet2
+    Properties:
+      VpcId: !If [CreateNewVpc, !Ref Vpc, !Ref ExistingVpcId]
+      CidrBlock: !Ref PublicSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-2'
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: CreateNewVpc
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-rt'
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    Condition: CreateNewVpc
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateNewVpc
+    Properties:
+      SubnetId: !If [CreateNewPublicSubnet, !Ref PublicSubnet, !Ref ExistingPublicSubnetId]
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateNewVpc
+    Properties:
+      SubnetId: !If [CreateNewPublicSubnet2, !Ref PublicSubnet2, !Ref ExistingPublicSubnet2Id]
+      RouteTableId: !Ref PublicRouteTable
+
+  # ============================================================
+  # NAT Gateway (private subnet internet access)
+  # ============================================================
+
+  NatGatewayEip:
+    Type: AWS::EC2::EIP
+    Condition: CreateNewVpc
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-nat-eip'
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Condition: CreateNewVpc
+    Properties:
+      AllocationId: !GetAtt NatGatewayEip.AllocationId
+      SubnetId: !If [CreateNewPublicSubnet, !Ref PublicSubnet, !Ref ExistingPublicSubnetId]
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-nat'
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ============================================================
+  # Private subnets (gateway instances)
+  # ============================================================
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Condition: CreateNewPrivateSubnet
+    Properties:
+      VpcId: !If [CreateNewVpc, !Ref Vpc, !Ref ExistingVpcId]
+      CidrBlock: !Ref PrivateSubnetCidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-1'
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Condition: CreateNewPrivateSubnet2
+    Properties:
+      VpcId: !If [CreateNewVpc, !Ref Vpc, !Ref ExistingVpcId]
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-2'
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: CreateNewVpc
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-rt'
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Condition: CreateNewVpc
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateNewVpc
+    Properties:
+      SubnetId: !If [CreateNewPrivateSubnet, !Ref PrivateSubnet, !Ref ExistingPrivateSubnetId]
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateNewVpc
+    Properties:
+      SubnetId: !If [CreateNewPrivateSubnet2, !Ref PrivateSubnet2, !Ref ExistingPrivateSubnet2Id]
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ============================================================
+  # Secrets Manager
+  # ============================================================
+
+  NetskopeSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}-netskope-credentials'
+      Description: Netskope tenant URL and API token — read only by the activation Lambda.
+      SecretString: !Sub '{"tenant_url": "${NetskopeTenantUrl}", "api_token": "${NetskopeApiToken}"}'
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  AIGBootstrapSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}-aig-bootstrap'
+      Description: >
+        Enrollment token written by the activation Lambda on each instance launch.
+        The AIG appliance reads this at boot via UserData and self-enrolls. Scale one
+        instance at a time — concurrent launches share this secret and may race.
+      SecretString: '{"bootstrap": true, "enrollment_token": ""}'
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ============================================================
+  # Security Groups
+  # ============================================================
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: AIG ALB - HTTPS inbound from internet, egress to gateway instances.
+      VpcId: !If [CreateNewVpc, !Ref Vpc, !Ref ExistingVpcId]
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: '0.0.0.0/0'
+          Description: HTTPS from internet
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: '0.0.0.0/0'
+          Description: HTTPS to gateway instances
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-alb-sg'
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  GatewaySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: AIG gateway - HTTPS inbound from ALB only, all egress.
+      VpcId: !If [CreateNewVpc, !Ref Vpc, !Ref ExistingVpcId]
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+          Description: HTTPS from ALB
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+          Description: All outbound for appliance services and Netskope cloud.
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-gateway-sg'
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ============================================================
+  # IAM — Gateway instance role
+  # ============================================================
+
+  GatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-gateway-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: ReadBootstrapSecret
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadBootstrapSecret
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref AIGBootstrapSecret
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  GatewayInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${AWS::StackName}-gateway-profile'
+      Roles: [!Ref GatewayRole]
+
+  # ============================================================
+  # IAM — Activation Lambda role
+  # ============================================================
+
+  ActivationLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-activation-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ActivationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteLogs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt ActivationLambdaLogGroup.Arn
+              - Sid: GetNetskopeSecret
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref NetskopeSecret
+              - Sid: WriteBootstrapSecret
+                Effect: Allow
+                Action: secretsmanager:PutSecretValue
+                Resource: !Ref AIGBootstrapSecret
+              - Sid: ApplianceIdParam
+                Effect: Allow
+                Action: [ssm:PutParameter, ssm:GetParameter, ssm:DeleteParameter]
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/aig/${AWS::StackName}/*'
+              - Sid: DescribeInstances
+                Effect: Allow
+                Action: ec2:DescribeInstances
+                Resource: '*'
+              - Sid: CompleteLifecycle
+                Effect: Allow
+                Action: autoscaling:CompleteLifecycleAction
+                Resource: !Sub 'arn:aws:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/${AWS::StackName}-asg'
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ============================================================
+  # IAM — SNS lifecycle role
+  # ============================================================
+
+  LifecycleSnsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-lifecycle-sns-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: autoscaling.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PublishToSns
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref LifecycleSnsTopic
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ============================================================
+  # Activation Lambda — register + write secret + CONTINUE immediately.
+  # No Step Functions. The ALB HTTPS health check on port 443 gates
+  # InService: passes only after the gateway is serving responses,
+  # which occurs after enrollment completes (Option A gating).
+  # ============================================================
+
+  ActivationLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-activation'
+      RetentionInDays: 30
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  ActivationLambdaFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: ActivationLambdaLogGroup
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-activation'
+      Description: ASG lifecycle handler - registers appliance, writes bootstrap token, completes lifecycle immediately.
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      MemorySize: 128
+      Role: !GetAtt ActivationLambdaRole.Arn
+      Environment:
+        Variables:
+          STACK_NAME: !Ref 'AWS::StackName'
+          SECRET_ARN: !Ref NetskopeSecret
+          BOOTSTRAP_SECRET_ARN: !Ref AIGBootstrapSecret
+      Code:
+        ZipFile: |
+          import json, os, urllib.request, boto3, traceback
+
+          sm  = boto3.client('secretsmanager')
+          ssm = boto3.client('ssm')
+          asg = boto3.client('autoscaling')
+          ec2 = boto3.client('ec2')
+
+          def api_call(url, path, token, method='GET', body=None):
+              req = urllib.request.Request(
+                  f"{url.rstrip('/')}{path}",
+                  json.dumps(body).encode() if body else None,
+                  method=method)
+              req.add_header('Netskope-Api-Token', token)
+              req.add_header('Content-Type', 'application/json')
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  return json.loads(r.read())
+
+          def complete(msg, result):
+              asg.complete_lifecycle_action(
+                  LifecycleHookName=msg['LifecycleHookName'],
+                  AutoScalingGroupName=msg['AutoScalingGroupName'],
+                  LifecycleActionToken=msg['LifecycleActionToken'],
+                  LifecycleActionResult=result)
+
+          def handler(event, context):
+              record = event.get('Records', [{}])[0]
+              if record.get('EventSource') != 'aws:sns':
+                  return
+              msg = json.loads(record['Sns']['Message'])
+              if msg.get('Event') == 'autoscaling:TEST_NOTIFICATION':
+                  return
+
+              instance_id = msg['EC2InstanceId']
+              transition  = msg['LifecycleTransition']
+              stack_name  = os.environ['STACK_NAME']
+
+              try:
+                  creds = json.loads(sm.get_secret_value(SecretId=os.environ['SECRET_ARN'])['SecretString'])
+                  url, token = creds['tenant_url'], creds['api_token']
+
+                  if transition == 'autoscaling:EC2_INSTANCE_LAUNCHING':
+                      ip = ec2.describe_instances(InstanceIds=[instance_id])\
+                             ['Reservations'][0]['Instances'][0].get('PrivateIpAddress', '0.0.0.0')
+                      resp = api_call(url, '/api/v2/aig/appliances', token, 'POST', {
+                          'name': f'{stack_name}-gw-{instance_id}',
+                          'host': ip,
+                          'ports': {'https': {'port': 443, 'enable': True},
+                                    'http':  {'port': 80,  'enable': False}},
+                      })
+                      aid = str(resp['id'])
+                      tok = resp.get('enrollment_token') or api_call(
+                          url, f'/api/v2/aig/appliances/{aid}/enrollmenttokens',
+                          token, 'POST').get('token', '')
+                      ssm.put_parameter(Name=f'/aig/{stack_name}/{instance_id}',
+                                        Value=aid, Type='String', Overwrite=True)
+                      sm.put_secret_value(SecretId=os.environ['BOOTSTRAP_SECRET_ARN'],
+                                          SecretString=json.dumps({'bootstrap': True,
+                                                                    'enrollment_token': tok}))
+                      print(f'Registered appliance {aid} for {instance_id}, completing CONTINUE')
+                      complete(msg, 'CONTINUE')
+
+                  elif transition == 'autoscaling:EC2_INSTANCE_TERMINATING':
+                      try:
+                          aid = ssm.get_parameter(Name=f'/aig/{stack_name}/{instance_id}')\
+                                   ['Parameter']['Value']
+                          api_call(url, f'/api/v2/aig/appliances/{aid}', token, 'DELETE')
+                          ssm.delete_parameter(Name=f'/aig/{stack_name}/{instance_id}')
+                          print(f'Deregistered appliance {aid} for {instance_id}')
+                      except Exception:
+                          print(traceback.format_exc())
+                      complete(msg, 'CONTINUE')
+
+              except Exception:
+                  print(traceback.format_exc())
+                  try:
+                      complete(msg, 'ABANDON')
+                  except Exception:
+                      print(traceback.format_exc())
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ============================================================
+  # SNS lifecycle integration
+  # ============================================================
+
+  LifecycleSnsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-lifecycle'
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  LifecycleSnsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref LifecycleSnsTopic
+      Protocol: lambda
+      Endpoint: !GetAtt ActivationLambdaFunction.Arn
+
+  LambdaLifecyclePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ActivationLambdaFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref LifecycleSnsTopic
+
+  # ============================================================
+  # Application Load Balancer
+  # HTTPS listener with ACM cert — HTTPS health check on port 443
+  # passes only when the gateway is serving HTTP responses, which
+  # occurs after enrollment completes (Option A health-check gating).
+  # ============================================================
+
+  GatewayAlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${AWS::StackName}-alb'
+      Type: application
+      Scheme: internet-facing
+      SecurityGroups: [!Ref AlbSecurityGroup]
+      Subnets:
+        - !If [CreateNewPublicSubnet, !Ref PublicSubnet, !Ref ExistingPublicSubnetId]
+        - !If [CreateNewPublicSubnet2, !Ref PublicSubnet2, !Ref ExistingPublicSubnet2Id]
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  GatewayTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${AWS::StackName}-tg'
+      VpcId: !If [CreateNewVpc, !Ref Vpc, !Ref ExistingVpcId]
+      Protocol: HTTPS
+      Port: 443
+      TargetType: instance
+      HealthCheckProtocol: HTTPS
+      HealthCheckPort: '443'
+      HealthCheckPath: /
+      Matcher:
+        HttpCode: '200-499'
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  GatewayAlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref GatewayAlb
+      Protocol: HTTPS
+      Port: 443
+      Certificates:
+        - CertificateArn: !Ref AcmCertificateArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref GatewayTargetGroup
+
+  # ============================================================
+  # Launch Template + Auto Scaling Group
+  # ============================================================
+
+  GatewayLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${AWS::StackName}-lt'
+      LaunchTemplateData:
+        ImageId: !Ref GatewayAmiId
+        InstanceType: !Ref InstanceType
+        SecurityGroupIds: [!Ref GatewaySecurityGroup]
+        IamInstanceProfile:
+          Name: !Ref GatewayInstanceProfile
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1
+            Ebs:
+              Encrypted: true
+              VolumeSize: 400
+              VolumeType: gp3
+        MetadataOptions:
+          HttpTokens: required
+          HttpEndpoint: enabled
+        UserData:
+          Fn::Base64: !Sub '{"bootstrap_secret": "${AWS::StackName}-aig-bootstrap"}'
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${AWS::StackName}-gateway'
+              - Key: Project
+                Value: !Ref Project
+              - Key: Environment
+                Value: !Ref Environment
+              - Key: ManagedBy
+                Value: CloudFormation
+
+  GatewayAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn:
+      - LifecycleSnsSubscription
+      - LambdaLifecyclePermission
+    Properties:
+      AutoScalingGroupName: !Sub '${AWS::StackName}-asg'
+      LaunchTemplate:
+        LaunchTemplateId: !Ref GatewayLaunchTemplate
+        Version: !GetAtt GatewayLaunchTemplate.LatestVersionNumber
+      MinSize: !Ref MinSize
+      MaxSize: !Ref MaxSize
+      DesiredCapacity: !Ref MinSize
+      VPCZoneIdentifier:
+        - !If [CreateNewPrivateSubnet, !Ref PrivateSubnet, !Ref ExistingPrivateSubnetId]
+        - !If [CreateNewPrivateSubnet2, !Ref PrivateSubnet2, !Ref ExistingPrivateSubnet2Id]
+      TargetGroupARNs:
+        - !Ref GatewayTargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 600
+      LifecycleHookSpecificationList:
+        - LifecycleHookName: !Sub '${AWS::StackName}-launch-hook'
+          LifecycleTransition: autoscaling:EC2_INSTANCE_LAUNCHING
+          HeartbeatTimeout: 120
+          DefaultResult: ABANDON
+          NotificationTargetARN: !Ref LifecycleSnsTopic
+          RoleARN: !GetAtt LifecycleSnsRole.Arn
+        - LifecycleHookName: !Sub '${AWS::StackName}-terminate-hook'
+          LifecycleTransition: autoscaling:EC2_INSTANCE_TERMINATING
+          HeartbeatTimeout: 120
+          DefaultResult: CONTINUE
+          NotificationTargetARN: !Ref LifecycleSnsTopic
+          RoleARN: !GetAtt LifecycleSnsRole.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+          PropagateAtLaunch: false
+        - Key: Environment
+          Value: !Ref Environment
+          PropagateAtLaunch: false
+        - Key: ManagedBy
+          Value: CloudFormation
+          PropagateAtLaunch: false
+
+  # ============================================================
+  # Step Scaling — +1 instance per CPU alarm breach.
+  # One instance at a time preserves bootstrap secret integrity.
+  # ============================================================
+
+  GatewayScaleOutPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref GatewayAutoScalingGroup
+      PolicyType: StepScaling
+      AdjustmentType: ChangeInCapacity
+      MetricAggregationType: Average
+      EstimatedInstanceWarmup: 600
+      StepAdjustments:
+        - MetricIntervalLowerBound: 0
+          ScalingAdjustment: 1
+
+  GatewayHighCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-high-cpu'
+      AlarmDescription: Scale out AIG ASG when average CPU exceeds threshold for two consecutive 5-minute periods.
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref GatewayAutoScalingGroup
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref ScaleOutCpuThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref GatewayScaleOutPolicy
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+Outputs:
+  VpcId:
+    Description: VPC ID (created or existing)
+    Value: !If [CreateNewVpc, !Ref Vpc, !Ref ExistingVpcId]
+
+  AlbDnsName:
+    Description: ALB DNS name - configure your DNS CNAME to this value
+    Value: !GetAtt GatewayAlb.DNSName
+
+  AutoScalingGroupName:
+    Description: ASG name
+    Value: !Ref GatewayAutoScalingGroup
+
+  ScaleOutAlarmName:
+    Description: CloudWatch alarm that triggers scale-out
+    Value: !Ref GatewayHighCpuAlarm
+
+  BootstrapSecretName:
+    Description: Bootstrap secret name
+    Value: !Sub '${AWS::StackName}-aig-bootstrap'
+
+  ActivationLogGroup:
+    Description: Activation Lambda log group
+    Value: !Sub '/aws/lambda/${AWS::StackName}-activation'

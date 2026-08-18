@@ -1,0 +1,1286 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  DLPoD (DLP on Demand) gateway — ASG of DLPoD appliances behind a private internal ALB.
+  Each instance is automatically tethered to the Netskope management plane via SSH/TUI
+  automation orchestrated by a Step Functions state machine (paramiko + pyte). The tethered
+  service is exposed via Route 53 private DNS at the configured domain name. Creates its own
+  VPC with public subnets (NAT gateway), private subnets (DLPoD instances and internal ALB),
+  and all required networking.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: DLPoD Appliance
+        Parameters: [DlpodAmiId, DlpodInstanceType, DlpodLicenseKey]
+      - Label:
+          default: Capacity
+        Parameters: [DlpodMinCapacity, DlpodMaxCapacity, DlpodDesiredCapacity]
+      - Label:
+          default: Service DNS
+        Parameters: [DlpDomainName]
+      - Label:
+          default: VPC
+        Parameters: [VpcCidr, DnsServer, PublicSubnet1Cidr, PublicSubnet2Cidr, PrivateSubnet1Cidr, PrivateSubnet2Cidr]
+      - Label:
+          default: Lambda Code (S3)
+        Parameters: [LambdaCodeBucket, DlpodLambdaCodeKey, LambdaLayerKey]
+      - Label:
+          default: Tagging
+        Parameters: [Project, Environment]
+    ParameterLabels:
+      DlpodAmiId:
+        default: DLPoD AMI ID
+      DlpodInstanceType:
+        default: Instance Type
+      DlpodLicenseKey:
+        default: License Key
+      DlpodMinCapacity:
+        default: Minimum Capacity
+      DlpodMaxCapacity:
+        default: Maximum Capacity
+      DlpodDesiredCapacity:
+        default: Desired Capacity
+      DlpDomainName:
+        default: DLP Service Domain Name
+      VpcCidr:
+        default: VPC CIDR
+      DnsServer:
+        default: VPC DNS Server IP
+      PublicSubnet1Cidr:
+        default: Public Subnet AZ 1 CIDR
+      PublicSubnet2Cidr:
+        default: Public Subnet AZ 2 CIDR
+      PrivateSubnet1Cidr:
+        default: Private Subnet AZ 1 CIDR
+      PrivateSubnet2Cidr:
+        default: Private Subnet AZ 2 CIDR
+      LambdaCodeBucket:
+        default: S3 Bucket
+      DlpodLambdaCodeKey:
+        default: DLPoD Lambda S3 Key
+      LambdaLayerKey:
+        default: Paramiko Layer S3 Key
+
+Parameters:
+
+  DlpodAmiId:
+    Type: AWS::EC2::Image::Id
+    Default: ami-0973780ab75c2fb28
+    Description: >
+      DLPoD appliance AMI ID. Default is DLP On Demand in us-west-1 — override for other regions.
+      Obtain region-specific AMI IDs from Netskope support or the AWS Marketplace listing.
+
+  DlpodInstanceType:
+    Type: String
+    Default: c5a.4xlarge
+    AllowedValues: [c5a.4xlarge, c5a.8xlarge, c5a.16xlarge, c5ad.4xlarge, c5ad.8xlarge, c5ad.16xlarge]
+    Description: DLPoD instance type. c5a available in most regions.
+
+  DlpodLicenseKey:
+    Type: String
+    NoEcho: true
+    Description: >
+      DLPoD license key (Netskope console: Settings > Security Cloud Platform >
+      On-Premises Infrastructure).
+
+  DlpodMinCapacity:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    Description: Minimum number of DLPoD instances.
+
+  DlpodMaxCapacity:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    Description: Maximum number of DLPoD instances.
+
+  DlpodDesiredCapacity:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    Description: Initial desired number of DLPoD instances.
+
+  DlpDomainName:
+    Type: String
+    Default: dlp.aigw.internal
+    Description: >
+      Private DNS name for the DLPoD ALB. Must be a subdomain of aigw.internal (the Route 53
+      private hosted zone created by this stack). Example: dlp.aigw.internal.
+
+  VpcCidr:
+    Type: String
+    Default: '10.0.0.0/16'
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    ConstraintDescription: Must be a valid IPv4 CIDR block.
+    Description: CIDR block for the new VPC.
+
+  DnsServer:
+    Type: String
+    Default: '10.0.0.2'
+    Description: >
+      VPC DNS resolver IP — always the VPC CIDR base address + 2 (e.g. 10.0.0.2 for 10.0.0.0/16).
+      Override when using a non-default VpcCidr.
+
+  PublicSubnet1Cidr:
+    Type: String
+    Default: '10.0.1.0/24'
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    ConstraintDescription: Must be a valid IPv4 CIDR block.
+    Description: CIDR for the first public subnet (AZ 1) — NAT gateway is placed here.
+
+  PublicSubnet2Cidr:
+    Type: String
+    Default: '10.0.2.0/24'
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    ConstraintDescription: Must be a valid IPv4 CIDR block.
+    Description: CIDR for the second public subnet (AZ 2).
+
+  PrivateSubnet1Cidr:
+    Type: String
+    Default: '10.0.10.0/24'
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    ConstraintDescription: Must be a valid IPv4 CIDR block.
+    Description: CIDR for the first private subnet (AZ 1) — DLPoD instances and internal ALB.
+
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: '10.0.11.0/24'
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    ConstraintDescription: Must be a valid IPv4 CIDR block.
+    Description: CIDR for the second private subnet (AZ 2) — DLPoD instances and internal ALB.
+
+  LambdaCodeBucket:
+    Type: String
+    Description: S3 bucket containing the DLPoD Lambda package and paramiko layer.
+
+  DlpodLambdaCodeKey:
+    Type: String
+    Default: lambda-dlpod.zip
+    Description: S3 key for the DLPoD Lambda package (dlpod_handlers.handler).
+
+  LambdaLayerKey:
+    Type: String
+    Default: layers/pexpect-layer.zip
+    Description: S3 key for the paramiko/pyte Lambda layer.
+
+  Project:
+    Type: String
+    Description: Project name tag.
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: Lowercase alphanumeric and hyphens only.
+
+  Environment:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment tag.
+
+Resources:
+
+  # ============================================================
+  # VPC and networking
+  # ============================================================
+
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-vpc'
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-igw'
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-1'
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-2'
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-1'
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-2'
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-rt'
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-nat-eip'
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-nat'
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-rt'
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ============================================================
+  # Secrets Manager — DLPoD credentials
+  # ============================================================
+
+  DlpodCredentialsSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}-dlpod-creds'
+      Description: DLPoD license key and appliance password (updated by tethering Lambda).
+      SecretString: !Sub '{"license_key":"${DlpodLicenseKey}","default_password":"nsappliance","password":""}'
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ============================================================
+  # SSM Parameter — DLPoD cert (placeholder; written at stack create)
+  # ============================================================
+
+  DlpodCertParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${AWS::StackName}/dlpod-cert'
+      Type: String
+      Value: pending
+      Description: DLPoD ALB certificate PEM — overwritten by CertGeneratorFunction at stack create.
+
+  # ============================================================
+  # Certificate generator Custom Resource Lambda
+  # Runs at stack create: generates self-signed cert, imports to ACM,
+  # writes PEM to /${StackName}/dlpod-cert SSM parameter.
+  # Runs at stack delete: deletes the ACM certificate.
+  # ============================================================
+
+  CertGeneratorLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-certgen'
+      RetentionInDays: 30
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  CertGeneratorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-certgen-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CertGenPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteLogs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt CertGeneratorLogGroup.Arn
+              - Sid: ImportCert
+                Effect: Allow
+                # ACM ImportCertificate/DeleteCertificate do not support resource-level
+                # restrictions at import time (ARN unknown before creation).
+                Action: [acm:ImportCertificate, acm:DeleteCertificate, acm:AddTagsToCertificate]
+                Resource: '*'
+              - Sid: WriteCertParam
+                Effect: Allow
+                Action: ssm:PutParameter
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/*'
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  CertGeneratorFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: CertGeneratorLogGroup
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-certgen'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      MemorySize: 128
+      Role: !GetAtt CertGeneratorRole.Arn
+      Code:
+        ZipFile: |
+          import json, subprocess, tempfile, logging, urllib.request, boto3
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          acm = boto3.client('acm')
+          ssm = boto3.client('ssm')
+          def send_cfn(event, context, status, data={}, pid=None):
+              body = json.dumps({'Status': status, 'Reason': f'See {context.log_group_name}/{context.log_stream_name}', 'PhysicalResourceId': pid or event.get('PhysicalResourceId', 'none'), 'StackId': event['StackId'], 'RequestId': event['RequestId'], 'LogicalResourceId': event['LogicalResourceId'], 'Data': data}).encode()
+              urllib.request.urlopen(urllib.request.Request(event['ResponseURL'], data=body, headers={'Content-Type': '', 'Content-Length': str(len(body))}, method='PUT'))
+          def handler(event, context):
+              domain = event['ResourceProperties']['DomainName']
+              cert_param = event['ResourceProperties']['CertParameterName']
+              stack = event['ResourceProperties']['StackName']
+              rt = event['RequestType']
+              try:
+                  if rt in ('Create', 'Update'):
+                      with tempfile.TemporaryDirectory() as d:
+                          kf, cf, sc = f'{d}/k.pem', f'{d}/c.pem', f'{d}/s.cnf'
+                          subprocess.run(['openssl', 'genrsa', '-out', kf, '2048'], check=True, capture_output=True)
+                          with open(sc, 'w') as f:
+                              f.write(f"[req]\ndistinguished_name=dn\nx509_extensions=v3\nprompt=no\n[dn]\nCN={domain}\nO=Netskope\nOU=AI Gateway\n[v3]\nsubjectAltName=DNS:{domain}\nbasicConstraints=critical,CA:TRUE\nkeyUsage=digitalSignature,keyEncipherment,keyCertSign\nextendedKeyUsage=serverAuth\n")
+                          subprocess.run(['openssl', 'req', '-new', '-x509', '-key', kf, '-out', cf, '-days', '365', '-config', sc], check=True, capture_output=True)
+                          cert_pem = open(cf).read()
+                          key_pem = open(kf).read()
+                      r = acm.import_certificate(Certificate=cert_pem.encode(), PrivateKey=key_pem.encode(), Tags=[{'Key': 'StackName', 'Value': stack}])
+                      arn = r['CertificateArn']
+                      ssm.put_parameter(Name=cert_param, Value=cert_pem, Type='String', Overwrite=True)
+                      logger.info('Imported cert %s, wrote to SSM %s', arn, cert_param)
+                      send_cfn(event, context, 'SUCCESS', {'CertificateArn': arn}, arn)
+                  elif rt == 'Delete':
+                      arn = event.get('PhysicalResourceId', '')
+                      if arn.startswith('arn:'):
+                          try:
+                              acm.delete_certificate(CertificateArn=arn)
+                              logger.info('Deleted cert %s', arn)
+                          except Exception:
+                              logger.warning('Could not delete cert %s', arn, exc_info=True)
+                      send_cfn(event, context, 'SUCCESS', {}, arn)
+                  else:
+                      send_cfn(event, context, 'SUCCESS', {}, event.get('PhysicalResourceId', 'none'))
+              except Exception:
+                  logger.exception('CertGeneratorFunction failed')
+                  send_cfn(event, context, 'FAILED', {}, 'FAILED')
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  DlpodAlbCertificate:
+    Type: Custom::AlbCertificate
+    Properties:
+      ServiceToken: !GetAtt CertGeneratorFunction.Arn
+      DomainName: !Ref DlpDomainName
+      CertParameterName: !Sub '/${AWS::StackName}/dlpod-cert'
+      StackName: !Ref 'AWS::StackName'
+
+  # ============================================================
+  # Security Groups
+  # ============================================================
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: DLPoD tethering Lambda - egress only (SSH/HTTPS to DLPoD instances)
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+          Description: All outbound
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-lambda-sg'
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  DlpodAlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: DLPoD internal ALB - HTTPS ingress from VPC
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref VpcCidr
+          Description: HTTPS from VPC (internal ALB)
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref VpcCidr
+          Description: HTTPS to DLPoD instances
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-dlpod-alb-sg'
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  DlpodSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: DLPoD appliance - SSH from Lambda, HTTPS from ALB and Lambda
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+          Description: SSH from tethering Lambda
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref DlpodAlbSecurityGroup
+          Description: HTTPS from DLPoD ALB
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+          Description: HTTPS from tethering Lambda (cert check)
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+          Description: All outbound
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-dlpod-sg'
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ============================================================
+  # IAM — DLPoD instance role
+  # ============================================================
+
+  DlpodRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-dlpod-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  DlpodInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${AWS::StackName}-dlpod-profile'
+      Roles: [!Ref DlpodRole]
+
+  # ============================================================
+  # DLPoD Launch Template + Auto Scaling Group
+  # ============================================================
+
+  DlpodLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${AWS::StackName}-dlpod-lt'
+      LaunchTemplateData:
+        ImageId: !Ref DlpodAmiId
+        InstanceType: !Ref DlpodInstanceType
+        SecurityGroupIds: [!Ref DlpodSecurityGroup]
+        IamInstanceProfile:
+          Name: !Ref DlpodInstanceProfile
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1
+            Ebs:
+              Encrypted: true
+              VolumeSize: 351
+              VolumeType: gp3
+        MetadataOptions:
+          HttpTokens: required
+          HttpEndpoint: enabled
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${AWS::StackName}-dlpod'
+              - Key: Project
+                Value: !Ref Project
+              - Key: Environment
+                Value: !Ref Environment
+              - Key: ManagedBy
+                Value: CloudFormation
+
+  DlpodAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn:
+      - DlpodLifecycleSnsSubscription
+      - DlpodLifecyclePermission
+    Properties:
+      AutoScalingGroupName: !Sub '${AWS::StackName}-dlpod-asg'
+      LaunchTemplate:
+        LaunchTemplateId: !Ref DlpodLaunchTemplate
+        Version: !GetAtt DlpodLaunchTemplate.LatestVersionNumber
+      MinSize: !Ref DlpodMinCapacity
+      MaxSize: !Ref DlpodMaxCapacity
+      DesiredCapacity: !Ref DlpodDesiredCapacity
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      TargetGroupARNs: [!Ref DlpodTargetGroup]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 1800
+      LifecycleHookSpecificationList:
+        - LifecycleHookName: !Sub '${AWS::StackName}-dlpod-launch-hook'
+          LifecycleTransition: autoscaling:EC2_INSTANCE_LAUNCHING
+          HeartbeatTimeout: 1800
+          DefaultResult: ABANDON
+          NotificationTargetARN: !Ref DlpodLifecycleSnsTopic
+          RoleARN: !GetAtt DlpodLifecycleSnsRole.Arn
+        - LifecycleHookName: !Sub '${AWS::StackName}-dlpod-terminate-hook'
+          LifecycleTransition: autoscaling:EC2_INSTANCE_TERMINATING
+          HeartbeatTimeout: 60
+          DefaultResult: CONTINUE
+          NotificationTargetARN: !Ref DlpodLifecycleSnsTopic
+          RoleARN: !GetAtt DlpodLifecycleSnsRole.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+          PropagateAtLaunch: false
+        - Key: Environment
+          Value: !Ref Environment
+          PropagateAtLaunch: false
+        - Key: ManagedBy
+          Value: CloudFormation
+          PropagateAtLaunch: false
+
+  # ============================================================
+  # Internal ALB + Route 53 private DNS
+  # ALB placed in private subnets (internal scheme)
+  # ============================================================
+
+  DlpodAlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${AWS::StackName}-dlpod'
+      Scheme: internal
+      Type: application
+      SecurityGroups: [!Ref DlpodAlbSecurityGroup]
+      Subnets:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-dlpod-alb'
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  DlpodTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${AWS::StackName}-dlpod-tg'
+      Protocol: HTTPS
+      Port: 443
+      VpcId: !Ref Vpc
+      TargetType: instance
+      HealthCheckProtocol: HTTPS
+      HealthCheckPort: '443'
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      Matcher:
+        HttpCode: 200-499
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  DlpodHttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref DlpodAlb
+      Protocol: HTTPS
+      Port: 443
+      Certificates:
+        - CertificateArn: !GetAtt DlpodAlbCertificate.CertificateArn
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref DlpodTargetGroup
+
+  DlpodPrivateHostedZone:
+    Type: AWS::Route53::HostedZone
+    Properties:
+      Name: aigw.internal
+      VPCs:
+        - VPCId: !Ref Vpc
+          VPCRegion: !Ref 'AWS::Region'
+      HostedZoneConfig:
+        Comment: !Sub 'Private zone for DLPoD service — ${AWS::StackName}'
+
+  DlpodDnsRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref DlpodPrivateHostedZone
+      Name: !Ref DlpDomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt DlpodAlb.DNSName
+        HostedZoneId: !GetAtt DlpodAlb.CanonicalHostedZoneID
+
+  # ============================================================
+  # SNS lifecycle integration (ASG → DlpodActivationFunction)
+  # ============================================================
+
+  DlpodLifecycleSnsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-dlpod-lifecycle'
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  DlpodLifecycleSnsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-dlpod-lifecycle-sns-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: autoscaling.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PublishToSns
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref DlpodLifecycleSnsTopic
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ============================================================
+  # DLPoD activation Lambda — receives lifecycle events, starts Step Functions
+  # ============================================================
+
+  DlpodActivationLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-dlpod-activation'
+      RetentionInDays: 30
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  DlpodActivationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-dlpod-activation-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DlpodActivationPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteLogs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt DlpodActivationLogGroup.Arn
+              - Sid: DescribeInstances
+                Effect: Allow
+                Action: ec2:DescribeInstances
+                Resource: '*'
+              - Sid: CompleteLifecycle
+                Effect: Allow
+                Action: autoscaling:CompleteLifecycleAction
+                Resource: !Sub 'arn:aws:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/${AWS::StackName}-*'
+              - Sid: StartExecution
+                Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref DlpodTetheringStateMachine
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  DlpodActivationFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: DlpodActivationLogGroup
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-dlpod-activation'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      MemorySize: 128
+      Role: !GetAtt DlpodActivationRole.Arn
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref DlpodTetheringStateMachine
+          DNS_SERVER: !Ref DnsServer
+      Code:
+        ZipFile: |
+          import json, os, logging
+          import boto3
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          ec2 = boto3.client('ec2')
+          asg = boto3.client('autoscaling')
+          sfn = boto3.client('stepfunctions')
+          def get_ip(iid):
+              r = ec2.describe_instances(InstanceIds=[iid])
+              return r['Reservations'][0]['Instances'][0].get('PrivateIpAddress', '')
+          def handler(event, context):
+              for rec in event.get('Records', []):
+                  msg = json.loads(rec['Sns']['Message'])
+                  transition = msg.get('LifecycleTransition', '')
+                  iid = msg.get('EC2InstanceId', '')
+                  logger.info('DLPoD lifecycle: %s %s', transition, iid)
+                  if msg.get('Event') == 'autoscaling:TEST_NOTIFICATION':
+                      continue
+                  if transition == 'autoscaling:EC2_INSTANCE_TERMINATING':
+                      asg.complete_lifecycle_action(LifecycleHookName=msg['LifecycleHookName'], AutoScalingGroupName=msg['AutoScalingGroupName'], LifecycleActionToken=msg['LifecycleActionToken'], LifecycleActionResult='CONTINUE')
+                      continue
+                  if transition != 'autoscaling:EC2_INSTANCE_LAUNCHING':
+                      continue
+                  ip = get_ip(iid)
+                  if not ip:
+                      logger.error('No IP for %s — cannot start tethering', iid)
+                      continue
+                  sfn_input = {
+                      'dlpod_ip': ip,
+                      'password': 'nsappliance',
+                      'dns_primary': os.environ.get('DNS_SERVER', ''),
+                      'lifecycle': {
+                          'hook_name': msg['LifecycleHookName'],
+                          'asg_name': msg['AutoScalingGroupName'],
+                          'action_token': msg['LifecycleActionToken']
+                      }
+                  }
+                  sfn.start_execution(
+                      stateMachineArn=os.environ['STATE_MACHINE_ARN'],
+                      name=f'tether-{iid}',
+                      input=json.dumps(sfn_input))
+                  logger.info('Started tethering for %s at %s', iid, ip)
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  DlpodLifecycleSnsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref DlpodLifecycleSnsTopic
+      Protocol: lambda
+      Endpoint: !GetAtt DlpodActivationFunction.Arn
+
+  DlpodLifecyclePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref DlpodActivationFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref DlpodLifecycleSnsTopic
+
+  # ============================================================
+  # DLPoD tethering Lambda (VPC-attached, paramiko + pyte)
+  # Packaged from S3 — handler: dlpod_handlers.handler
+  # ============================================================
+
+  ParamikoLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub '${AWS::StackName}-paramiko'
+      Description: paramiko + pyte for SSH/TUI automation
+      CompatibleRuntimes: [python3.12]
+      Content:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref LambdaLayerKey
+
+  DlpodLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-dlpod'
+      RetentionInDays: 30
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  DlpodLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-dlpod-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DlpodLambdaPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteLogs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt DlpodLambdaLogGroup.Arn
+              - Sid: ReadDlpodSecret
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref DlpodCredentialsSecret
+              - Sid: CertParam
+                Effect: Allow
+                Action: [ssm:GetParameter, ssm:PutParameter]
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/*'
+              - Sid: VpcNetworking
+                Effect: Allow
+                # Required for VPC-attached Lambda ENI management — no resource scoping available.
+                Action: [ec2:CreateNetworkInterface, ec2:DescribeNetworkInterfaces, ec2:DeleteNetworkInterface]
+                Resource: '*'
+              - Sid: CompleteLifecycle
+                Effect: Allow
+                Action: autoscaling:CompleteLifecycleAction
+                Resource: !Sub 'arn:aws:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/${AWS::StackName}-*'
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  DlpodLambdaFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: DlpodLambdaLogGroup
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-dlpod'
+      Description: DLPoD SSH/TUI automation — password change, DNS, license, tethering check.
+      Runtime: python3.12
+      Handler: dlpod_handlers.handler
+      Timeout: 120
+      MemorySize: 256
+      Role: !GetAtt DlpodLambdaRole.Arn
+      Layers: [!Ref ParamikoLayer]
+      VpcConfig:
+        SecurityGroupIds: [!Ref LambdaSecurityGroup]
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Environment:
+        Variables:
+          DLPOD_SECRET_ARN: !Ref DlpodCredentialsSecret
+          DLPOD_CERT_PARAM: !Sub '/${AWS::StackName}/dlpod-cert'
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref DlpodLambdaCodeKey
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ============================================================
+  # Step Functions — DLPoD tethering state machine
+  # ============================================================
+
+  DlpodStepFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-dlpod-sfn-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeDlpodLambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt DlpodLambdaFunction.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  DlpodTetheringStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${AWS::StackName}-dlpod-tethering'
+      RoleArn: !GetAtt DlpodStepFunctionRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "DLPoD appliance tethering via SSH/TUI (paramiko + pyte)",
+          "StartAt": "WaitForDlpodSSH",
+          "States": {
+            "WaitForDlpodSSH": {
+              "Type": "Task",
+              "Resource": "${DlpodLambdaFunction.Arn}",
+              "Parameters": {"action": "dlpod_check_ssh", "dlpod_ip.$": "$.dlpod_ip", "password.$": "$.password"},
+              "ResultPath": "$.ssh_check",
+              "Next": "IsDlpodSSHReady",
+              "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "WaitBeforeDlpodSSHRetry", "ResultPath": "$.error"}]
+            },
+            "IsDlpodSSHReady": {
+              "Type": "Choice",
+              "Choices": [{"Variable": "$.ssh_check.ssh_ready", "BooleanEquals": true, "Next": "DlpodChangePassword"}],
+              "Default": "WaitBeforeDlpodSSHRetry"
+            },
+            "WaitBeforeDlpodSSHRetry": {"Type": "Wait", "Seconds": 15, "Next": "WaitForDlpodSSH"},
+            "DlpodChangePassword": {
+              "Type": "Task",
+              "Resource": "${DlpodLambdaFunction.Arn}",
+              "Parameters": {"action": "dlpod_change_password", "dlpod_ip.$": "$.dlpod_ip", "password.$": "$.password"},
+              "ResultPath": "$.pw_result",
+              "Next": "MergePassword",
+              "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "DlpodTetheringFailed", "ResultPath": "$.error"}]
+            },
+            "MergePassword": {
+              "Type": "Pass",
+              "Parameters": {"dlpod_ip.$": "$.dlpod_ip", "password.$": "$.pw_result.password", "dns_primary.$": "$.dns_primary", "lifecycle.$": "$.lifecycle"},
+              "Next": "DlpodSetDNS"
+            },
+            "DlpodSetDNS": {
+              "Type": "Task",
+              "Resource": "${DlpodLambdaFunction.Arn}",
+              "Parameters": {"action": "dlpod_set_dns", "dlpod_ip.$": "$.dlpod_ip", "password.$": "$.password", "dns_primary.$": "$.dns_primary"},
+              "ResultPath": "$.dns_result",
+              "Next": "DlpodSetLicense",
+              "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "DlpodTetheringFailed", "ResultPath": "$.error"}]
+            },
+            "DlpodSetLicense": {
+              "Type": "Task",
+              "Resource": "${DlpodLambdaFunction.Arn}",
+              "Parameters": {"action": "dlpod_set_license", "dlpod_ip.$": "$.dlpod_ip", "password.$": "$.password"},
+              "ResultPath": "$.license_result",
+              "Next": "WaitForDlpodTetheringInit",
+              "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "DlpodTetheringFailed", "ResultPath": "$.error"}]
+            },
+            "WaitForDlpodTetheringInit": {"Type": "Wait", "Seconds": 120, "Next": "CheckDlpodTethering"},
+            "CheckDlpodTethering": {
+              "Type": "Task",
+              "Resource": "${DlpodLambdaFunction.Arn}",
+              "Parameters": {"action": "dlpod_check_tethering", "dlpod_ip.$": "$.dlpod_ip", "password.$": "$.password"},
+              "ResultPath": "$.tethering",
+              "Next": "IsDlpodTethered",
+              "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "WaitBeforeDlpodTetheringRetry", "ResultPath": "$.error"}]
+            },
+            "IsDlpodTethered": {
+              "Type": "Choice",
+              "Choices": [{"Variable": "$.tethering.tethered", "BooleanEquals": true, "Next": "DlpodCompleteLifecycle"}],
+              "Default": "WaitBeforeDlpodTetheringRetry"
+            },
+            "WaitBeforeDlpodTetheringRetry": {"Type": "Wait", "Seconds": 60, "Next": "CheckDlpodTethering"},
+            "DlpodCompleteLifecycle": {
+              "Type": "Task",
+              "Resource": "${DlpodLambdaFunction.Arn}",
+              "Parameters": {"action": "dlpod_complete_lifecycle", "dlpod_ip.$": "$.dlpod_ip", "lifecycle.$": "$.lifecycle"},
+              "End": true,
+              "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "DlpodTetheringSucceededLifecycleFailed", "ResultPath": "$.error"}]
+            },
+            "DlpodTetheringSucceededLifecycleFailed": {"Type": "Succeed"},
+            "DlpodTetheringFailed": {"Type": "Fail", "Error": "DlpodTetheringFailed", "Cause": "DLPoD tethering failed"}
+          }
+        }
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+Outputs:
+
+  # ── VPC and networking — feed these into gateway-aig.yaml or gateway-combined.yaml ──
+
+  VpcId:
+    Description: VPC ID — ExistingVpcId parameter for gateway-aig.yaml
+    Value: !Ref Vpc
+
+  PublicSubnet1Id:
+    Description: Public subnet AZ 1 — ExistingPublicSubnetId parameter for gateway-aig.yaml
+    Value: !Ref PublicSubnet1
+
+  PublicSubnet2Id:
+    Description: Public subnet AZ 2 — ExistingPublicSubnet2Id parameter for gateway-aig.yaml
+    Value: !Ref PublicSubnet2
+
+  PrivateSubnet1Id:
+    Description: Private subnet AZ 1 — ExistingPrivateSubnetId parameter for gateway-aig.yaml
+    Value: !Ref PrivateSubnet1
+
+  PrivateSubnet2Id:
+    Description: Private subnet AZ 2 — ExistingPrivateSubnet2Id parameter for gateway-aig.yaml
+    Value: !Ref PrivateSubnet2
+
+  PrivateHostedZoneId:
+    Description: Route 53 private hosted zone ID (aigw.internal) — associate additional VPCs or stacks
+    Value: !Ref DlpodPrivateHostedZone
+
+  # ── DLPoD service — feed these into gateway-aig.yaml DLP configuration ──
+
+  DlpodServiceUrl:
+    Description: DLPoD HTTPS service URL via Route 53 private DNS — use as DLP endpoint in AIG config
+    Value: !Sub 'https://${DlpDomainName}'
+
+  DlpodCertParameterName:
+    Description: SSM parameter name containing the DLPoD ALB self-signed certificate PEM — consumed by gateway-aig.yaml or gateway-combined.yaml for DLP trust
+    Value: !Sub '/${AWS::StackName}/dlpod-cert'
+
+  DlpodAlbSecurityGroupId:
+    Description: DLPoD ALB security group ID — add an ingress rule on this SG for AIG instance traffic
+    Value: !Ref DlpodAlbSecurityGroup
+
+  DlpodAlbDnsName:
+    Description: Internal ALB DNS name (for verification — prefer DlpodServiceUrl for clients)
+    Value: !GetAtt DlpodAlb.DNSName
+
+  # ── Operational ──
+
+  TetheringStateMachineArn:
+    Description: Step Functions state machine ARN — monitor tethering progress in the console
+    Value: !Ref DlpodTetheringStateMachine
+
+  DlpodActivationLogGroup:
+    Description: Activation Lambda log group
+    Value: !Sub '/aws/lambda/${AWS::StackName}-dlpod-activation'
+
+  DlpodLambdaLogGroupName:
+    Description: Tethering Lambda log group
+    Value: !Sub '/aws/lambda/${AWS::StackName}-dlpod'

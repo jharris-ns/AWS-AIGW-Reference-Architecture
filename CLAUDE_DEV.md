@@ -13,19 +13,12 @@ deployment scenario and read only that template's directory.
 | AIG standalone | `aig/template/gateway-aig.yaml` | Gateway only, DLP handled separately |
 | DLPoD standalone | `dlpod/template/gateway-dlpod.yaml` | DLP appliance only |
 
-Legacy templates (`templates/gateway-asg.yaml`, `templates/gateway-asg-ssm.yaml`) remain in the
-repo for reference. Do not create new stacks with them — they predate the three-template split.
-
-Test templates (`templates/test-*.yaml`) are debug/bisect tools for specific subsystems.
 
 ## Directory Structure
 
 ```
 templates/
   gateway-combined.yaml       # Combined AIG + DLPoD (primary production template)
-  gateway-asg.yaml            # Legacy monolithic template (do not use for new deployments)
-  gateway-asg-ssm.yaml        # Legacy SSM variant
-  test-*.yaml                 # Debug and subsystem test templates
 
 aig/
   template/

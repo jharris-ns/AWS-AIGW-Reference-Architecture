@@ -197,8 +197,7 @@ curl -sf -o /dev/null -w "HTTP %{http_code}\n" \
 |---|---|---|---|---|
 | `GatewayAmiId` | AWS::EC2::Image::Id | `ami-0a66805d7fb085df4` (v1.7.54, us-west-1) | No* | AIG appliance AMI v1.7 or later. Default is us-west-1 only — override for other regions. |
 | `InstanceType` | String | `m5.4xlarge` | No | Allowed: `m5.4xlarge`, `m6i.4xlarge`, `c5.4xlarge` |
-| `MinSize` | Number | `1` | No | Minimum instances |
-| `MaxSize` | Number | `4` | No | Maximum instances |
+| `DesiredCapacity` | Number | `1` | No | Desired instances (1–4). ASG min is fixed at 1, max at 4. |
 | `ScaleOutCpuThreshold` | Number | `70` | No | CPU % that triggers +1 instance scale-out |
 | `AcmCertificateArn` | String | — | Yes | ACM cert ARN for the ALB HTTPS listener |
 

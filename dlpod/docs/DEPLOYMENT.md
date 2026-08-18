@@ -168,9 +168,7 @@ aws s3 ls s3://<bucket>/layers/pexpect-layer.zip --region <region>
 
 | Parameter | Type | Default | Required | Description |
 |---|---|---|---|---|
-| `DlpodMinCapacity` | Number | `1` | No | Minimum instances. |
-| `DlpodMaxCapacity` | Number | `4` | No | Maximum instances. |
-| `DlpodDesiredCapacity` | Number | `1` | No | Initial desired instances. |
+| `DlpodDesiredCapacity` | Number | `1` | No | Desired instances (1–4). ASG min is fixed at 1, max at 4. |
 
 ### Service DNS
 

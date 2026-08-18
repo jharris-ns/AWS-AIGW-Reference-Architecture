@@ -5,6 +5,8 @@ together with [DLP On Demand](https://docs.netskope.com/en/data-loss-prevention-
 single stack. A new VPC is created — no pre-existing networking is required. Both services are
 configured, enrolled, and wired together before entering service, with no manual steps.
 
+![Architecture](docs/architecture.png)
+
 ---
 
 ## Template Options

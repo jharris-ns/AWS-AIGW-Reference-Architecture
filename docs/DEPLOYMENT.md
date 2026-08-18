@@ -281,10 +281,22 @@ Note the bucket name — it is required as the `LambdaCodeBucket` stack paramete
       "Resource": "*"
     },
     {
-      "Sid": "S3",
+      "Sid": "S3Bucket",
       "Effect": "Allow",
-      "Action": ["s3:GetObject", "s3:PutObject", "s3:CreateBucket", "s3:ListBucket"],
+      "Action": ["s3:CreateBucket", "s3:ListBucket", "s3:GetBucketLocation"],
+      "Resource": "arn:aws:s3:::netskope-aigw-templates-*"
+    },
+    {
+      "Sid": "S3Objects",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject"],
       "Resource": "arn:aws:s3:::netskope-aigw-templates-*/*"
+    },
+    {
+      "Sid": "STS",
+      "Effect": "Allow",
+      "Action": "sts:GetCallerIdentity",
+      "Resource": "*"
     }
   ]
 }

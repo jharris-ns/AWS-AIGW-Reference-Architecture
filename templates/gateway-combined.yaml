@@ -14,10 +14,10 @@ Metadata:
         Parameters: [NetskopeTenantUrl, NetskopeApiToken]
       - Label:
           default: AI Gateway Appliance
-        Parameters: [GatewayAmiId, InstanceType, AcmCertificateArn, MinSize, MaxSize, ScaleOutCpuThreshold]
+        Parameters: [GatewayAmiId, InstanceType, AcmCertificateArn, DesiredCapacity, ScaleOutCpuThreshold]
       - Label:
           default: DLPoD Appliance
-        Parameters: [DlpodAmiId, DlpodInstanceType, DlpodLicenseKey, DlpodMinCapacity, DlpodMaxCapacity, DlpodDesiredCapacity, DlpDomainName]
+        Parameters: [DlpodAmiId, DlpodInstanceType, DlpodLicenseKey, DlpodDesiredCapacity, DlpDomainName]
       - Label:
           default: VPC
         Parameters: [VpcCidr, DnsServer, PublicSubnet1Cidr, PublicSubnet2Cidr, PrivateSubnet1Cidr, PrivateSubnet2Cidr]
@@ -38,10 +38,8 @@ Metadata:
         default: AIG Instance Type
       AcmCertificateArn:
         default: ACM Certificate ARN (optional — auto-generated if empty)
-      MinSize:
-        default: AIG Min Instances
-      MaxSize:
-        default: AIG Max Instances
+      DesiredCapacity:
+        default: AIG Desired Instances
       ScaleOutCpuThreshold:
         default: AIG Scale-out CPU %
       DlpodAmiId:
@@ -50,10 +48,6 @@ Metadata:
         default: DLPoD Instance Type
       DlpodLicenseKey:
         default: DLPoD License Key
-      DlpodMinCapacity:
-        default: DLPoD Min Instances
-      DlpodMaxCapacity:
-        default: DLPoD Max Instances
       DlpodDesiredCapacity:
         default: DLPoD Desired Instances
       DlpDomainName:
@@ -106,17 +100,12 @@ Parameters:
       use and API clients; clients must trust the cert or disable TLS verification).
       For production with public DNS, provide a valid ACM certificate ARN.
 
-  MinSize:
+  DesiredCapacity:
     Type: Number
     Default: 1
     MinValue: 1
-    Description: Minimum AIG instances.
-
-  MaxSize:
-    Type: Number
-    Default: 4
-    MinValue: 1
-    Description: Maximum AIG instances.
+    MaxValue: 4
+    Description: Desired number of AIG instances (1–4). Min is fixed at 1, max at 4.
 
   ScaleOutCpuThreshold:
     Type: Number
@@ -147,23 +136,12 @@ Parameters:
       DLPoD license key (Netskope console: Settings > Security Cloud Platform >
       On-Premises Infrastructure).
 
-  DlpodMinCapacity:
-    Type: Number
-    Default: 1
-    MinValue: 1
-    Description: Minimum DLPoD instances.
-
-  DlpodMaxCapacity:
-    Type: Number
-    Default: 4
-    MinValue: 1
-    Description: Maximum DLPoD instances.
-
   DlpodDesiredCapacity:
     Type: Number
     Default: 1
     MinValue: 1
-    Description: Initial desired DLPoD instances.
+    MaxValue: 4
+    Description: Desired number of DLPoD instances (1–4). Min is fixed at 1, max at 4.
 
   DlpDomainName:
     Type: String
@@ -1536,8 +1514,8 @@ Resources:
       LaunchTemplate:
         LaunchTemplateId: !Ref DlpodLaunchTemplate
         Version: !GetAtt DlpodLaunchTemplate.LatestVersionNumber
-      MinSize: !Ref DlpodMinCapacity
-      MaxSize: !Ref DlpodMaxCapacity
+      MinSize: '1'
+      MaxSize: '4'
       DesiredCapacity: !Ref DlpodDesiredCapacity
       VPCZoneIdentifier: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
       TargetGroupARNs: [!Ref DlpodTargetGroup]
@@ -1855,9 +1833,9 @@ Resources:
       LaunchTemplate:
         LaunchTemplateId: !Ref GatewayLaunchTemplate
         Version: !GetAtt GatewayLaunchTemplate.LatestVersionNumber
-      MinSize: !Ref MinSize
-      MaxSize: !Ref MaxSize
-      DesiredCapacity: !Ref MinSize
+      MinSize: '1'
+      MaxSize: '4'
+      DesiredCapacity: !Ref DesiredCapacity
       VPCZoneIdentifier: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
       TargetGroupARNs: [!Ref GatewayTargetGroup]
       HealthCheckType: ELB

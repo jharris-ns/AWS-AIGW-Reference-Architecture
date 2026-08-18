@@ -18,7 +18,7 @@ Metadata:
         Parameters: [GatewayAmiId, InstanceType]
       - Label:
           default: Scaling
-        Parameters: [MinSize, MaxSize, ScaleOutCpuThreshold]
+        Parameters: [DesiredCapacity, ScaleOutCpuThreshold]
       - Label:
           default: Load Balancer
         Parameters: [AcmCertificateArn]
@@ -80,20 +80,12 @@ Parameters:
     AllowedValues: [m5.4xlarge, m6i.4xlarge, c5.4xlarge]
     Description: EC2 instance type (minimum 16 vCPU, 64 GiB RAM).
 
-  MinSize:
+  DesiredCapacity:
     Type: Number
     Default: 1
     MinValue: 1
-    Description: Minimum number of gateway instances.
-
-  MaxSize:
-    Type: Number
-    Default: 4
-    MinValue: 1
-    Description: >
-      Maximum number of gateway instances. The step scaling policy adds one instance
-      per alarm breach, ensuring the bootstrap secret is not overwritten mid-flight
-      by a concurrent launch.
+    MaxValue: 4
+    Description: Desired number of gateway instances (1–4). Min is fixed at 1, max at 4.
 
   ScaleOutCpuThreshold:
     Type: Number
@@ -907,9 +899,9 @@ Resources:
       LaunchTemplate:
         LaunchTemplateId: !Ref GatewayLaunchTemplate
         Version: !GetAtt GatewayLaunchTemplate.LatestVersionNumber
-      MinSize: !Ref MinSize
-      MaxSize: !Ref MaxSize
-      DesiredCapacity: !Ref MinSize
+      MinSize: '1'
+      MaxSize: '4'
+      DesiredCapacity: !Ref DesiredCapacity
       VPCZoneIdentifier:
         - !If [CreateNewPrivateSubnet, !Ref PrivateSubnet, !Ref ExistingPrivateSubnetId]
         - !If [CreateNewPrivateSubnet2, !Ref PrivateSubnet2, !Ref ExistingPrivateSubnet2Id]

@@ -364,8 +364,7 @@ aws s3 ls s3://<bucket>/layers/pexpect-layer.zip --region <region>
 | `GatewayAmiId` | AWS::EC2::Image::Id | `ami-0a66805d7fb085df4` (us-west-1) | No* | AI Gateway AMI v1.7 or later. Default is us-west-1 only — override for other regions. |
 | `InstanceType` | String | `m5.4xlarge` | No | Allowed: `m5.4xlarge`, `m6i.4xlarge`, `c5.4xlarge`. |
 | `AcmCertificateArn` | String | `''` (auto-generate) | No | ACM certificate ARN for the internet-facing AI Gateway ALB. Leave empty to auto-generate a self-signed cert. |
-| `MinSize` | Number | `1` | No | Minimum AI Gateway instances. |
-| `MaxSize` | Number | `4` | No | Maximum AI Gateway instances. |
+| `DesiredCapacity` | Number | `1` | No | Desired AI Gateway instances (1–4). ASG min is fixed at 1, max at 4. |
 | `ScaleOutCpuThreshold` | Number | `70` | No | Average CPU % that triggers AI Gateway scale-out (+1 instance). |
 
 ### DLP On Demand appliance
@@ -375,9 +374,7 @@ aws s3 ls s3://<bucket>/layers/pexpect-layer.zip --region <region>
 | `DlpodAmiId` | AWS::EC2::Image::Id | `ami-0973780ab75c2fb28` (us-west-1) | No* | DLP On Demand AMI. Default is us-west-1 — override for other regions. |
 | `DlpodInstanceType` | String | `c5a.4xlarge` | No | Allowed: `c5a.4xlarge`, `c5a.8xlarge`, `c5a.16xlarge`, `c5ad.4xlarge`, `c5ad.8xlarge`, `c5ad.16xlarge`. |
 | `DlpodLicenseKey` | String (NoEcho) | — | Yes | DLP On Demand license key. |
-| `DlpodMinCapacity` | Number | `1` | No | Minimum DLP On Demand instances. |
-| `DlpodMaxCapacity` | Number | `4` | No | Maximum DLP On Demand instances. |
-| `DlpodDesiredCapacity` | Number | `1` | No | Initial desired DLP On Demand instances. |
+| `DlpodDesiredCapacity` | Number | `1` | No | Desired DLP On Demand instances (1–4). ASG min is fixed at 1, max at 4. |
 | `DlpDomainName` | String | `dlp.aigw.internal` | No | Private DNS name for the DLP On Demand internal ALB. |
 
 ### VPC

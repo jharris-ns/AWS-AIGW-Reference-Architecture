@@ -15,7 +15,7 @@ Metadata:
         Parameters: [DlpodAmiId, DlpodInstanceType, DlpodLicenseKey]
       - Label:
           default: Capacity
-        Parameters: [DlpodMinCapacity, DlpodMaxCapacity, DlpodDesiredCapacity]
+        Parameters: [DlpodDesiredCapacity]
       - Label:
           default: Service DNS
         Parameters: [DlpDomainName]
@@ -35,10 +35,6 @@ Metadata:
         default: Instance Type
       DlpodLicenseKey:
         default: License Key
-      DlpodMinCapacity:
-        default: Minimum Capacity
-      DlpodMaxCapacity:
-        default: Maximum Capacity
       DlpodDesiredCapacity:
         default: Desired Capacity
       DlpDomainName:
@@ -84,23 +80,12 @@ Parameters:
       DLPoD license key (Netskope console: Settings > Security Cloud Platform >
       On-Premises Infrastructure).
 
-  DlpodMinCapacity:
-    Type: Number
-    Default: 1
-    MinValue: 1
-    Description: Minimum number of DLPoD instances.
-
-  DlpodMaxCapacity:
-    Type: Number
-    Default: 2
-    MinValue: 1
-    Description: Maximum number of DLPoD instances.
-
   DlpodDesiredCapacity:
     Type: Number
     Default: 1
     MinValue: 1
-    Description: Initial desired number of DLPoD instances.
+    MaxValue: 4
+    Description: Desired number of DLPoD instances (1–4). Min is fixed at 1, max at 4.
 
   DlpDomainName:
     Type: String
@@ -701,8 +686,8 @@ Resources:
       LaunchTemplate:
         LaunchTemplateId: !Ref DlpodLaunchTemplate
         Version: !GetAtt DlpodLaunchTemplate.LatestVersionNumber
-      MinSize: !Ref DlpodMinCapacity
-      MaxSize: !Ref DlpodMaxCapacity
+      MinSize: '1'
+      MaxSize: '4'
       DesiredCapacity: !Ref DlpodDesiredCapacity
       VPCZoneIdentifier:
         - !Ref PrivateSubnet1

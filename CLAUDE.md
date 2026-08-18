@@ -2,99 +2,236 @@
 
 Project instructions for Claude Code — deployment and operations.
 
-For development and template modification guidelines, see [CLAUDE_DEV.md](CLAUDE_DEV.md).
+For template development and modification guidelines, see [CLAUDE_DEV.md](CLAUDE_DEV.md).
 
-## Project Overview
+---
 
-This is an **AWS reference architecture for Netskope AI Gateway** — a CloudFormation-based deployment that automates the provisioning, enrollment, and lifecycle management of Netskope AI Gateway appliances in an Auto Scaling Group behind an Application Load Balancer.
+## What This Project Does
 
-The AI Gateway acts as an inline security enforcement layer between AI-powered applications and LLM providers (AWS Bedrock, OpenAI, etc.), providing DLP, content moderation, authentication, rate limiting, and compliance logging.
+This is an **AWS CloudFormation reference architecture for Netskope AI Gateway and DLP On Demand**.
+It provisions, enrolls, and operates both services automatically — no manual steps after deployment.
 
-## Architecture
+The AI Gateway sits inline between applications and LLM providers (Bedrock, OpenAI, etc.),
+enforcing DLP, prompt injection detection, access control, rate limiting, and audit logging.
+DLP On Demand runs the content inspection locally inside the VPC so no data leaves the AWS account.
 
-Inbound traffic from the internet arrives at an internet-facing Application Load Balancer listening on HTTPS port 443, deployed across two public subnets. The ALB forwards requests to a target group backed by an Auto Scaling Group of Netskope AI Gateway instances running in private subnets. These instances reach the internet through a NAT gateway for outbound API calls. Each gateway instance optionally forwards content to a DLPoD (DLP on Demand) appliance for inline data loss prevention inspection before proxying requests onward to upstream LLM providers such as AWS Bedrock or OpenAI.
+---
 
-### Lifecycle Automation
+## Template Options
 
-Each gateway instance is automatically enrolled and configured through this chain:
+Three CloudFormation templates are available. Use the one that matches the deployment goal.
 
-1. **ASG launches instance** → inline lifecycle hook holds it in `Pending:Wait`
-2. **SNS** delivers lifecycle event to **Activation Lambda**
-3. **Activation Lambda** reads Netskope API credentials from Secrets Manager, registers appliance with tenant API, receives enrollment token (held in memory only), starts **Step Functions** execution
-4. **Step Functions** orchestrates enrollment via the **Enrollment Lambda** (VPC-attached, paramiko + pyte): waits for SSH → navigates aig-cli TUI → polls pre-enrollment → submits token → polls completion → calls `CompleteLifecycleAction`
-5. Instance moves to `InService`
-6. On termination: Activation Lambda deregisters appliance from tenant, cleans up SSM parameter (appliance ID only)
+| Template | File | Use when |
+|---|---|---|
+| **Combined** | `templates/gateway-combined.yaml` | Deploying AIG + DLP On Demand together (recommended) |
+| **AIG only** | `aig/template/gateway-aig.yaml` | AIG without DLP On Demand, or adding AIG to an existing VPC |
+| **DLPoD only** | `dlpod/template/gateway-dlpod.yaml` | DLP On Demand standalone, or before deploying AIG separately |
 
-DLPoD (DLP On Demand) appliances run in a separate ASG with their own lifecycle hooks, mirroring the gateway pattern. Each DLPoD instance is automatically tethered to the Netskope management plane. The AIG enrollment state machine configures DLP on each gateway after enrollment completes.
+Each template creates its own VPC — no pre-existing networking is required.
+The combined template automatically wires the DLP certificate and endpoint into the AIG bootstrap
+configuration before any instances launch. The individual templates are for cases where only one
+service is needed, or where they are being added to an existing environment.
 
-### Secret Handling
+---
 
-Netskope API credentials never touch the gateway instances. The Activation Lambda reads from Secrets Manager and calls the Netskope API to generate an enrollment token, which exists only in Lambda memory. The token is passed directly to the instance over SSH and never persisted to any AWS storage service. The instance IAM role only needs CloudWatch Logs permissions — no access to Secrets Manager or Parameter Store.
+## Using Docs to Deploy or Operate
 
-## Deployment
+The simplest way to perform any task is to ask Claude to read the relevant document and follow it.
 
-Build Lambda artifacts and deploy:
+| Task | Instruction to give |
+|---|---|
+| Deploy AIG + DLPoD together | "Read docs/DEPLOYMENT.md and deploy the combined stack" |
+| Deploy AIG only | "Read aig/docs/DEPLOYMENT.md and deploy" |
+| Deploy DLPoD only | "Read dlpod/docs/DEPLOYMENT.md and deploy" |
+| Quick deploy (minimal guidance) | "Read docs/QUICKSTART.md and deploy" |
+| Operate a running stack | "Read docs/OPERATIONS.md" |
+| Troubleshoot a failing stack | "Read docs/TROUBLESHOOTING.md" |
+| Understand the architecture | "Read docs/ARCHITECTURE.md" |
+| Review security posture | "Read docs/SECURITY.md" |
+
+Providing credentials as environment variables avoids them appearing in the conversation:
 
 ```bash
-# Build and upload Lambda packages to S3
-scripts/deploy-artifacts.sh us-west-1
+export NETSKOPE_API_KEY=<token>
+export DLPOD_LICENSE_KEY=<license-key>
+```
 
-# Upload template to S3 (required — template exceeds 51KB)
-aws s3 cp templates/gateway-asg.yaml s3://<s3-bucket>/templates/gateway-asg.yaml
+Then reference them by name: "use $NETSKOPE_API_KEY for the API token".
 
-# Deploy with a new VPC (omit Existing* parameters)
+---
+
+## Prerequisites
+
+Before deploying, confirm:
+
+- [ ] AWS CLI configured (`aws sts get-caller-identity` returns your account)
+- [ ] IAM permissions for CloudFormation, EC2, IAM, ELB, Auto Scaling, Lambda, Step Functions,
+  Secrets Manager, SNS, Route 53, ACM, SSM, CloudWatch — see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#6-aws-permissions)
+- [ ] AI Gateway AMI subscribed in AWS Marketplace (search "Netskope AI Gateway")
+- [ ] DLP On Demand AMI subscribed in AWS Marketplace (search "Netskope DLP On Demand") — combined and DLPoD templates only
+- [ ] Netskope tenant URL (`https://<tenant>.goskope.com`)
+- [ ] Netskope RBAC v3 API token with AIG Administrator role
+- [ ] DLP On Demand license key — combined and DLPoD templates only
+
+> **Region:** AMI defaults are for **us-west-1 only**. For other regions, look up the AMI IDs
+> after subscribing and pass them as `GatewayAmiId` / `DlpodAmiId` parameters.
+
+---
+
+## Deployment — Combined Template (Quick Reference)
+
+Full instructions: [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)
+
+```bash
+# Step 1 — Upload Lambda artifacts to S3
+scripts/deploy-artifacts.sh <region>
+# Creates bucket netskope-aigw-templates-<account-id> and uploads 4 artifacts from dist/
+# Override bucket: LAMBDA_BUCKET=<name> scripts/deploy-artifacts.sh <region>
+
+# Step 2 — Upload template to S3 (required — exceeds 51 KB limit)
+BUCKET=netskope-aigw-templates-<account-id>
+REGION=<region>
+aws s3 cp templates/gateway-combined.yaml \
+  s3://$BUCKET/templates/gateway-combined.yaml --region $REGION
+
+# Step 3 — Deploy
 aws cloudformation create-stack \
-  --stack-name <name> \
-  --template-url https://<s3-bucket>.s3.<region>.amazonaws.com/templates/gateway-asg.yaml \
+  --stack-name <stack-name> \
+  --template-url https://$BUCKET.s3.$REGION.amazonaws.com/templates/gateway-combined.yaml \
   --parameters \
     ParameterKey=NetskopeTenantUrl,ParameterValue=https://tenant.goskope.com \
     ParameterKey=NetskopeApiToken,ParameterValue=<token> \
-    ParameterKey=GatewayAmiId,ParameterValue=<ami-id> \
-    ParameterKey=LambdaCodeBucket,ParameterValue=<s3-bucket> \
-    ParameterKey=DlpodAmiId,ParameterValue=<dlpod-ami-id> \
     ParameterKey=DlpodLicenseKey,ParameterValue=<license-key> \
-    ParameterKey=DnsServer,ParameterValue=<dns-ip> \
-  --capabilities CAPABILITY_NAMED_IAM
+    ParameterKey=LambdaCodeBucket,ParameterValue=$BUCKET \
+    ParameterKey=Project,ParameterValue=aigw \
+    ParameterKey=Environment,ParameterValue=prod \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --region $REGION
 ```
 
-The template exceeds 51KB and must be uploaded to S3 before deployment. Use `--template-url` to reference the S3 location.
+Stack creation takes **12–18 minutes**. After `CREATE_COMPLETE`, both services are enrolled and
+serving. Check progress: `aws cloudformation describe-stacks --stack-name <name> --query 'Stacks[0].StackStatus' --output text`
 
-See [DEPLOYMENT.md](docs/DEPLOYMENT.md) for full instructions including existing VPC deployments and artifact updates.
+---
+
+## Deployment — Individual Templates
+
+**AIG only** — full instructions: [aig/docs/DEPLOYMENT.md](aig/docs/DEPLOYMENT.md)
+
+The AIG template uses an inline Lambda (no S3 artifact upload required). The template is ~34 KB
+and can be uploaded directly in the CloudFormation console.
+
+```bash
+BUCKET=netskope-aigw-templates-<account-id>
+REGION=<region>
+aws s3 cp aig/template/gateway-aig.yaml \
+  s3://$BUCKET/templates/gateway-aig.yaml --region $REGION
+
+aws cloudformation create-stack \
+  --stack-name <stack-name> \
+  --template-url https://$BUCKET.s3.$REGION.amazonaws.com/templates/gateway-aig.yaml \
+  --parameters \
+    ParameterKey=NetskopeTenantUrl,ParameterValue=https://tenant.goskope.com \
+    ParameterKey=NetskopeApiToken,ParameterValue=<token> \
+    ParameterKey=AcmCertificateArn,ParameterValue=<acm-arn> \
+    ParameterKey=Project,ParameterValue=aigw \
+    ParameterKey=Environment,ParameterValue=prod \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --region $REGION
+```
+
+**DLPoD only** — full instructions: [dlpod/docs/DEPLOYMENT.md](dlpod/docs/DEPLOYMENT.md)
+
+```bash
+# Upload Lambda artifacts
+dlpod/scripts/deploy-artifacts.sh <region>
+
+# Upload template
+aws s3 cp dlpod/template/gateway-dlpod.yaml \
+  s3://$BUCKET/templates/gateway-dlpod.yaml --region $REGION
+
+aws cloudformation create-stack \
+  --stack-name <stack-name> \
+  --template-url https://$BUCKET.s3.$REGION.amazonaws.com/templates/gateway-dlpod.yaml \
+  --parameters \
+    ParameterKey=DlpodLicenseKey,ParameterValue=<license-key> \
+    ParameterKey=LambdaCodeBucket,ParameterValue=$BUCKET \
+    ParameterKey=Project,ParameterValue=aigw \
+    ParameterKey=Environment,ParameterValue=prod \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --region $REGION
+```
+
+---
 
 ## Operations Quick Reference
 
+Full reference: [docs/OPERATIONS.md](docs/OPERATIONS.md)
+
 | Task | Command |
-|------|---------|
-| Check instance states | `aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names <stack>-asg --query "AutoScalingGroups[0].Instances[*].[InstanceId,LifecycleState]" --output table` |
-| Check enrollment progress | `aws stepfunctions list-executions --state-machine-arn arn:aws:states:<region>:<account>:stateMachine:<stack>-enrollment --output table` |
-| Scale out | `aws autoscaling update-auto-scaling-group --auto-scaling-group-name <stack>-asg --desired-capacity <N>` |
-| View enrollment logs | `aws logs tail /aws/lambda/<stack>-enrollment --since 30m` |
-| View activation logs | `aws logs tail /aws/lambda/<stack>-activation --since 30m` |
-| Check DLPoD instances | `aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names <stack>-dlpod-asg --query "AutoScalingGroups[0].Instances[*].[InstanceId,LifecycleState]" --output table` |
+|---|---|
+| Check AIG instance states | `aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names <stack>-aig-asg --query "AutoScalingGroups[0].Instances[*].[InstanceId,LifecycleState,HealthStatus]" --output table` |
+| Check AIG enrollment | `aws stepfunctions list-executions --state-machine-arn arn:aws:states:<region>:<account>:stateMachine:<stack>-aig-enrollment --output table` |
+| Scale AIG | `aws autoscaling update-auto-scaling-group --auto-scaling-group-name <stack>-aig-asg --desired-capacity <N>` |
+| View AIG activation logs | `aws logs tail /aws/lambda/<stack>-aig-activation --since 30m` |
+| Check DLPoD instance states | `aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names <stack>-dlpod-asg --query "AutoScalingGroups[0].Instances[*].[InstanceId,LifecycleState,HealthStatus]" --output table` |
 | Check DLPoD tethering | `aws stepfunctions list-executions --state-machine-arn arn:aws:states:<region>:<account>:stateMachine:<stack>-dlpod-tethering --output table` |
 | Scale DLPoD | `aws autoscaling update-auto-scaling-group --auto-scaling-group-name <stack>-dlpod-asg --desired-capacity <N>` |
-| View DLPoD logs | `aws logs tail /aws/lambda/<stack>-dlpod --since 30m` |
+| View DLPoD tethering logs | `aws logs tail /aws/lambda/<stack>-dlpod --since 30m` |
+| Get stack outputs | `aws cloudformation describe-stacks --stack-name <stack> --query "Stacks[0].Outputs[*].[OutputKey,OutputValue]" --output table` |
+| Delete stack | `aws cloudformation delete-stack --stack-name <stack> --region <region>` |
+
+---
+
+## Architecture Summary
+
+```
+Internet → AIG ALB (HTTPS:443, internet-facing)
+               ↓
+         AI Gateway ASG (private subnets)
+               ↓ inline DLP inspection
+         DLPoD ALB (HTTPS:443, internal, dlp.aigw.internal)
+               ↓
+         DLP On Demand ASG (private subnets)
+```
+
+**Lifecycle automation (AIG):** ASG launch hook → SNS → Activation Lambda → Step Functions →
+Enrollment Lambda (SSH/TUI) → enrollment complete → `CompleteLifecycleAction` → InService.
+
+**Lifecycle automation (DLPoD):** ASG launch hook → SNS → Activation Lambda → Step Functions →
+Tethering Lambda (SSH/CLI, paramiko) → tethering complete → `CompleteLifecycleAction` → InService.
+
+**Secret handling:** API credentials never reach instances. The Activation Lambda exchanges the
+API token for a short-lived enrollment token in memory, writes it to Secrets Manager, and instances
+read only the bootstrap secret. Instance IAM roles have no access to the API credentials secret.
+
+---
+
+## Documentation Index
+
+| Document | Contents |
+|---|---|
+| [docs/QUICKSTART.md](docs/QUICKSTART.md) | Prerequisites checklist, three-step deploy, console alternative |
+| [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | Full parameter reference, preflight checks, deploy options, verification |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | VPC design, traffic flows, IAM roles, HA, cost estimate |
+| [docs/OPERATIONS.md](docs/OPERATIONS.md) | Scaling, monitoring, log groups, AMI upgrade procedure |
+| [docs/SECURITY.md](docs/SECURITY.md) | IAM least privilege, secrets handling, encryption |
+| [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Issue/Cause/Solution format, diagnostic commands |
+| [aig/docs/DEPLOYMENT.md](aig/docs/DEPLOYMENT.md) | AIG standalone: ACM cert, deploy options, verification |
+| [aig/docs/OPERATIONS.md](aig/docs/OPERATIONS.md) | AIG standalone: enrollment flow, scaling, troubleshooting |
+| [dlpod/docs/DEPLOYMENT.md](dlpod/docs/DEPLOYMENT.md) | DLPoD standalone: S3 artifacts, deploy options, verification |
+| [dlpod/docs/OPERATIONS.md](dlpod/docs/OPERATIONS.md) | DLPoD standalone: tethering flow, scaling, troubleshooting |
+| [CLAUDE_DEV.md](CLAUDE_DEV.md) | Template conventions, resource inventory, development rules |
+
+---
 
 ## Rules
 
-- **Lambda artifacts and the template must be uploaded to S3** before deployment. The S3 bucket must be in the same region as the stack. The template exceeds 51KB and must be deployed via S3 `--template-url`.
-- **CUDA NVIDIA GPU required** for advanced AI guardrails — standard guardrails work on CPU instances (m5.4xlarge), but advanced guardrails need GPU instances (g4dn, g5).
-
-## Documentation
-
-| Document | Purpose |
-|----------|---------|
-| [README.md](README.md) | Prerequisites, parameters, deployment |
-| [DEPLOYMENT.md](docs/DEPLOYMENT.md) | Build artifacts, upload to S3, deploy |
-| [DEVOPS.md](docs/DEVOPS.md) | Lifecycle, scaling, secrets, VPC requirements |
-| [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Claude Code usage, AWS credentials, failure diagnosis, manual recovery |
-| [CERTIFICATE_MANAGEMENT.md](docs/CERTIFICATE_MANAGEMENT.md) | Automatic certificate generation, requirements, renewal |
-| [DLPOD_AUTOMATION.md](docs/DLPOD_AUTOMATION.md) | DLPoD CLI reference, tethering flow, test results, gotchas |
-| [CLAUDE_DEV.md](CLAUDE_DEV.md) | Template conventions, resource inventory, development rules |
-
-## Related Resources
-
-- [Netskope AI Gateway Documentation](https://docs.netskope.com/en/ai-gateway/)
-- [Netskope RBAC V3 Overview](https://docs.netskope.com/en/netskope-rbac-v3-overview/)
-- [DLP On Demand Documentation](https://docs.netskope.com/en/data-loss-prevention-on-demand/)
-- [AI Gateway Sizing Guidelines](https://docs.netskope.com/en/ai-gateway-sizing-guidelines/)
+- **Templates over 51 KB must be deployed via S3 `--template-url`** — the combined and DLPoD
+  templates exceed this limit. The AIG template (~34 KB) can be uploaded directly in the console.
+- **Lambda artifacts must be in S3 before `create-stack`** — the S3 bucket must be in the same
+  region as the stack. Use `scripts/deploy-artifacts.sh` (combined) or
+  `dlpod/scripts/deploy-artifacts.sh` (DLPoD standalone).
+- **Pre-built artifacts in `dist/` are ready to use** — no Docker or build tools required.
+  Set `REBUILD=1` to rebuild from source (Lambda layer requires Docker or Podman for x86_64).
+- **AMI defaults are us-west-1 only** — override `GatewayAmiId` and `DlpodAmiId` for other regions.

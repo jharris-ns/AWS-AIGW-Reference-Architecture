@@ -2,6 +2,9 @@
 *.zip
 *.bak
 
+# Pre-built Lambda artifacts (tracked intentionally for user convenience)
+!dist/*.zip
+
 # IDE
 .idea/
 *.iml
@@ -13,6 +16,10 @@
 # Python
 __pycache__/
 *.pyc
+
+# Planning and internal notes
+planning/
+docs/legacy/
 
 # Dev-only docs (not shipped to customers)
 docs/SSH_TUNNEL_PROPOSAL.md
@@ -26,6 +33,8 @@ scripts/build-lambda.sh
 scripts/build-tui-lambda.sh
 scripts/requirements.txt
 templates/gateway-asg-ssm.yaml
+templates/aig-config-api-bootstrap.yaml
+templates/gateway-simple.yaml
 templates/test-ssh-tunnel.yaml
 templates/test-step-function.yaml
 

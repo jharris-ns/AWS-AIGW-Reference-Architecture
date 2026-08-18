@@ -302,6 +302,17 @@ Note the bucket name — it is required as the `LambdaCodeBucket` stack paramete
 }
 ```
 
+> **Production hardening:** The `IAM` statement above uses `Resource: "*"`. For production
+> deployments, scope it to your stack name prefix to prevent the deployer from creating roles
+> outside the stack's scope:
+> ```
+> "Resource": [
+>   "arn:aws:iam::*:role/<stack-prefix>-*",
+>   "arn:aws:iam::*:instance-profile/<stack-prefix>-*"
+> ]
+> ```
+> For example, if your stack name is `aigw-prod`, use `arn:aws:iam::*:role/aigw-prod-*`.
+
 </details>
 
 ---

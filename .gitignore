@@ -25,6 +25,10 @@ docs/legacy/
 docs/SSH_TUNNEL_PROPOSAL.md
 docs/TUI_ENROLLMENT_PLAN.md
 
+# Internal Confluence docs (not committed to repo)
+docs/CONFLUENCE.md
+docs/CONFLUENCE_DRAFT.md
+
 # Dev-only scripts and templates
 scripts/lambda_function.py
 scripts/lambda_tui_test.py

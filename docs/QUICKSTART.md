@@ -1,6 +1,6 @@
 # Quick Start — AI Gateway + DLP On Demand
 
-Get both services deployed and traffic flowing in under 20 minutes. This guide is written for
+Get both services deployed and traffic flowing in under 30 minutes. This guide is written for
 Netskope customers and sales engineers — AWS CLI experience helpful but not required. A console
 alternative is provided for deploy.
 
@@ -10,7 +10,7 @@ See [DEPLOYMENT.md](DEPLOYMENT.md) for the full parameter reference and advanced
 
 - [What You'll Need](#what-youll-need)
 - [Step 1 — Subscribe to AMIs](#step-1--subscribe-to-amis)
-- [Step 2 — Build and Upload Lambda Packages](#step-2--build-and-upload-lambda-packages)
+- [Step 2 — Create the Template Bucket](#step-2--create-the-template-bucket)
 - [Step 3 — Deploy the Stack](#step-3--deploy-the-stack)
 - [What to Expect](#what-to-expect)
 - [Verify Deployment](#verify-deployment)
@@ -23,7 +23,7 @@ See [DEPLOYMENT.md](DEPLOYMENT.md) for the full parameter reference and advanced
 Complete this checklist before starting. All five items are required.
 
 - [ ] **AWS account** with IAM permissions to deploy CloudFormation stacks with `CAPABILITY_NAMED_IAM`.
-  A minimal IAM policy is in [DEPLOYMENT.md](DEPLOYMENT.md#6-aws-permissions).
+  A minimal IAM policy is in [DEPLOYMENT.md](DEPLOYMENT.md#5-aws-permissions).
 
 - [ ] **AWS CLI** installed and configured (`aws configure` or environment variables set).
   Verify with: `aws sts get-caller-identity`
@@ -44,9 +44,15 @@ Complete this checklist before starting. All five items are required.
   > **Where to find it in the Netskope portal:**
   > **Settings → Security Cloud Platform → On-Premises Infrastructure**
 
-> **Apple Silicon (M1/M2/M3):** Docker or Podman is required to build the Lambda layer in Step 2.
-> Install [Docker Desktop](https://docs.docker.com/desktop/install/mac-install/) or Podman before
-> continuing.
+> **No build tools required.** All four Lambda functions in the template are inline — there is
+> nothing to package, no Lambda layer, and no Docker step. The only S3 upload is the template
+> itself (Step 2), because it is larger than CloudFormation's 51 KB direct-upload limit.
+
+> **Optional — AI Guardrails:** the template can also deploy a GPU-backed AI Guardrails tier
+> (`GuardrailsImageS3Bucket` + `GuardrailsAmiId`). It needs the `aisecurity-llm.tgz` tarball in an S3 bucket, a Deep Learning Base GPU AMI,
+> and G-instance quota, and adds a second readiness gate (multi-GB image pull) to stack creation.
+> This guide leaves it disabled;
+> see [DEPLOYMENT.md — AI Guardrails (optional)](DEPLOYMENT.md#ai-guardrails-optional).
 
 ---
 
@@ -66,8 +72,9 @@ stack can launch instances. Subscription is free — you pay only for EC2 instan
 2. Click **Continue to Subscribe**
 3. Accept the terms and click **Accept Terms**
 
-> **Region note:** The AI Gateway AMI default (`ami-0a66805d7fb085df4`) is for **us-west-1 only**.
-> If deploying in a different region, look up the AMI ID after subscribing:
+> **Region note:** The AMI defaults (`GatewayAmiId` = `ami-0a66805d7fb085df4`,
+> `DlpodAmiId` = `ami-0973780ab75c2fb28`) are for **us-west-1 only**.
+> If deploying in a different region, look up the AMI IDs after subscribing:
 > ```bash
 > aws ec2 describe-images \
 >   --filters 'Name=name,Values=*Netskope AI Gateway*' \
@@ -78,13 +85,12 @@ stack can launch instances. Subscription is free — you pay only for EC2 instan
 
 ---
 
-## Step 2 — Upload Lambda Packages
+## Step 2 — Create the Template Bucket
 
-**Why this step:** CloudFormation cannot create the Lambda functions until their code packages
-exist in S3. The stack needs four artifacts — three Lambda function packages and one Lambda layer —
-uploaded to an S3 bucket **in the same region as your stack**. The bucket name becomes the
-`LambdaCodeBucket` stack parameter. Pre-built artifacts are included in the repository's `dist/`
-folder, so no build tools are required.
+**Why this step:** `templates/gateway-combined.yaml` is about 68 KB, which exceeds CloudFormation's
+51 KB limit for direct template upload (`--template-body` or the console file picker). The template
+must be stored in an S3 bucket **in the same region as your stack**, and CloudFormation reads it
+from there. Nothing else goes in the bucket — there are no Lambda packages or layers to upload.
 
 ### Option A — Script (recommended)
 
@@ -92,16 +98,11 @@ folder, so no build tools are required.
 scripts/deploy-artifacts.sh <region>
 ```
 
-This creates a bucket named `netskope-aigw-templates-<account-id>` in the target region, uploads
-all four pre-built artifacts from `dist/`, and prints the bucket name at the end.
-
-> **Need to rebuild from source?** Set `REBUILD=1` before running the script. This requires
-> Docker Desktop or Podman for the Lambda layer build step:
-> `REBUILD=1 scripts/deploy-artifacts.sh <region>`
+This creates a bucket named `netskope-aigw-templates-<account-id>` in the target region (or
+reuses it if it already exists) and prints the bucket name at the end. To use a different bucket
+name: `LAMBDA_BUCKET=<name> scripts/deploy-artifacts.sh <region>`.
 
 ### Option B — Manual (AWS Console)
-
-**1. Create the S3 bucket**
 
 Open the [S3 Console](https://s3.console.aws.amazon.com/s3/) and click **Create bucket**.
 
@@ -112,50 +113,14 @@ Open the [S3 Console](https://s3.console.aws.amazon.com/s3/) and click **Create 
 
 Click **Create bucket**.
 
-> Note the bucket name — it is the value you will enter for `LambdaCodeBucket` in Step 3.
-
-**2. Upload the Lambda function packages**
-
-Open the bucket you just created. Click **Upload** → **Add files**, then select all three files
-from the `dist/` folder in this repository:
-
-- `dist/lambda-activation.zip`
-- `dist/lambda-step-function.zip`
-- `dist/lambda-dlpod.zip`
-
-Click **Upload**. These three files go in the bucket root.
-
-**3. Upload the Lambda layer**
-
-The Lambda layer must be in a `layers/` prefix (subfolder) inside the bucket.
-
-Click **Create folder**, enter `layers`, then click **Create folder**.
-
-Open the `layers/` folder, click **Upload** → **Add files**, and select:
-
-- `dist/pexpect-layer.zip`
-
-Click **Upload**.
-
-**4. Verify the layout**
-
-Your bucket should contain:
-```
-netskope-aigw-templates-<account-id>/
-  lambda-activation.zip
-  lambda-step-function.zip
-  lambda-dlpod.zip
-  layers/
-    pexpect-layer.zip
-```
+> Note the bucket name — you will upload the template to it in Step 3.
 
 ---
 
 ## Step 3 — Deploy the Stack
 
-**Why this step:** The CloudFormation template is over 51 KB, which exceeds the limit for direct
-upload. It must be stored in S3 first, then CloudFormation reads it from there. You can deploy
-from the AWS CLI or entirely from the AWS Console.
+**Why this step:** Upload the template to the bucket from Step 2, then point CloudFormation at
+its S3 URL. You can deploy from the AWS CLI or entirely from the AWS Console.
 
 ### Option A — AWS CLI
 
@@ -176,24 +141,28 @@ aws cloudformation create-stack \
     ParameterKey=NetskopeTenantUrl,ParameterValue=https://tenant.goskope.com \
     ParameterKey=NetskopeApiToken,ParameterValue=<token> \
     ParameterKey=DlpodLicenseKey,ParameterValue=<license-key> \
-    ParameterKey=LambdaCodeBucket,ParameterValue=$BUCKET \
-    ParameterKey=Project,ParameterValue=aigw \
-    ParameterKey=Environment,ParameterValue=prod \
+  --tags Key=Project,Value=aigw Key=Environment,Value=prod Key=ManagedBy,Value=CloudFormation \
   --capabilities CAPABILITY_NAMED_IAM \
   --region $REGION
 ```
 
-All other parameters use defaults. The stack auto-generates a self-signed certificate for the
+Only these three parameters are required. All others use defaults. The `--tags` line passes
+`Project`, `Environment`, and `ManagedBy` tags to all stack resources (`Project` and `Environment`
+are not template parameters — use tags). The stack auto-generates a self-signed certificate for the
 AI Gateway ALB — omitting `AcmCertificateArn` is intentional. To use a custom ACM certificate,
 add: `ParameterKey=AcmCertificateArn,ParameterValue=<arn>`.
 
-Override `GatewayAmiId` and `DlpodAmiId` when deploying outside us-west-1.
+Override `GatewayAmiId` and `DlpodAmiId` when deploying outside us-west-1:
+`ParameterKey=GatewayAmiId,ParameterValue=<ami-id> ParameterKey=DlpodAmiId,ParameterValue=<ami-id>`.
+
+> **Tip:** to keep the token and license key out of your shell history, export them first
+> (`export NETSKOPE_API_KEY=...`, `export DLPOD_LICENSE_KEY=...`) and reference
+> `ParameterValue=$NETSKOPE_API_KEY` / `ParameterValue=$DLPOD_LICENSE_KEY`.
 
 ### Option B — AWS Console (no CLI required)
 
 **1. Upload the template to S3**
 
-CloudFormation cannot accept a template this large directly — it must be stored in S3 first.
 In your S3 bucket from Step 2, click **Create folder**, enter `templates`, click **Create folder**.
 Open the `templates/` folder, click **Upload** → **Add files**, and select
 `templates/gateway-combined.yaml` from this repository. Click **Upload**.
@@ -215,27 +184,33 @@ Select **Amazon S3 URL** and paste the template URL from above. Click **Next**.
 
 **4. Fill in stack parameters**
 
-Enter a stack name and fill in the required parameters:
+Enter a stack name and fill in the three required parameters:
 
 | Parameter | Value |
 |---|---|
-| Stack name | Your chosen stack name (e.g. `aigw-prod`) |
+| Stack name | Your chosen stack name (e.g. `aigw-prod`) — used as the prefix for every resource name |
 | `NetskopeTenantUrl` | `https://<tenant>.goskope.com` |
 | `NetskopeApiToken` | Your RBAC v3 API token |
 | `DlpodLicenseKey` | Your DLP On Demand license key |
-| `LambdaCodeBucket` | Bucket name from Step 2 |
-| `Project` | Lowercase label, e.g. `aigw` |
-| `Environment` | `dev`, `staging`, or `prod` |
 
 Leave all other parameters at their defaults. In particular:
-- `AcmCertificateArn` — leave **blank** to auto-generate a self-signed certificate
-- `GatewayAmiId` / `DlpodAmiId` — override only when deploying outside **us-west-1**
+
+| Parameter | Default | Notes |
+|---|---|---|
+| `AcmCertificateArn` | *(blank)* | Leave **blank** to auto-generate a self-signed certificate |
+| `GatewayAmiId` / `DlpodAmiId` | us-west-1 AMIs | Override only when deploying outside **us-west-1** |
+| `InstanceType` / `DlpodInstanceType` | `m5.4xlarge` / `c5a.4xlarge` | Sizing — see [ARCHITECTURE.md](ARCHITECTURE.md#instance-sizing-and-throughput) |
+| `DesiredCapacity` / `DlpodDesiredCapacity` | `1` / `1` | Initial instance counts (1–4) |
+| `ScaleOutCpuThreshold` | `70` | Average CPU % that adds an AI Gateway instance |
+| `VpcCidr` | `10.0.0.0/16` | New VPC CIDR; subnets are derived automatically |
+| `GuardrailsImageS3Bucket` and other `Guardrails*` | *(blank / disabled)* | Leave blank to skip the optional Guardrails tier |
 
 Click **Next**.
 
 **5. Configure stack options**
 
-No changes are required on this page. Click **Next**.
+Under **Tags**, add `Project`, `Environment`, and `ManagedBy` tags (e.g. `aigw`, `prod`,
+`CloudFormation`). These propagate to all stack resources. No other changes required. Click **Next**.
 
 **6. Review and submit**
 
@@ -249,16 +224,19 @@ Click **Submit**. CloudFormation opens the stack events view — refresh to watc
 
 ## What to Expect
 
-Stack resource creation takes approximately **8–12 minutes**. After `CREATE_COMPLETE`, appliances
-continue bootstrapping in the background — both flows run concurrently:
+Stack creation takes approximately **12–18 minutes** and is strictly ordered: DLP On Demand must
+be healthy before the first AI Gateway instance launches.
 
-| Service | Time to load balancer healthy | What's happening |
+| Phase | Time | What's happening |
 |---|---|---|
-| AI Gateway | 5–15 min from instance launch | Reads bootstrap secret at boot and self-enrolls autonomously |
-| DLP On Demand | 15–25 min from instance launch | SSH-based tethering automation via Step Functions |
+| Certificates + bootstrap | ~1 min | `<stack>-certgen` generates the DLPoD TLS hierarchy; `<stack>-dlpod-bootstrap-builder` assembles `bootstrap.json` into the DLPoD launch template UserData |
+| DLP On Demand | 5–10 min from instance launch | Appliance's `nsbootstrap.service` applies the cert, license key, DNS, and persona from UserData; DLPoD ALB target becomes healthy |
+| Readiness gate | until DLPoD healthy (max 14 min) | `DlpodReadinessGate` shows `CREATE_IN_PROGRESS` while it polls target health — this is normal |
+| AI Gateway | 5–15 min from instance launch | Activation Lambda registers the appliance with Netskope; instance reads the bootstrap secret at boot and self-enrolls with DLP forwarding configured |
 
-DLP inspection becomes active once at least one AI Gateway instance and one DLP On Demand instance
-are both load balancer healthy — typically 20–30 minutes after `CREATE_COMPLETE`.
+At `CREATE_COMPLETE` the DLPoD tier is already healthy; the AI Gateway instance may still be
+finishing enrollment for a few minutes (the AIG ASG grace period is 10 minutes). DLP inspection is
+active as soon as the AI Gateway ALB target is healthy.
 
 > **About the self-signed certificate:** The AI Gateway ALB presents a self-signed certificate
 > (`aig.aigw.internal` as CN/SAN). API clients must be configured to trust the cert or skip TLS
@@ -288,13 +266,22 @@ aws autoscaling describe-auto-scaling-groups \
 ```
 Look for `InService` / `Healthy`.
 
-**3. DLP On Demand tethering:**
+**3. DLP On Demand bootstrap:**
 ```bash
-aws stepfunctions list-executions \
-  --state-machine-arn <DlpodTetheringStateMachineArn from outputs> \
-  --query "executions[*].[name,status]" --output table --region <region>
+# ALB target health — "healthy" means nsbootstrap completed and HTTPS is serving
+aws elbv2 describe-target-health \
+  --target-group-arn $(aws elbv2 describe-target-groups \
+    --names <stack-name>-dlpod-tg --query "TargetGroups[0].TargetGroupArn" \
+    --output text --region <region>) \
+  --query "TargetHealthDescriptions[*].[Target.Id,TargetHealth.State,TargetHealth.Reason]" \
+  --output table --region <region>
+
+# Bootstrap builder Lambda log — confirms bootstrap.json was assembled at stack creation
+aws logs tail /aws/lambda/<stack-name>-dlpod-bootstrap-builder --since 1h --region <region>
 ```
-`SUCCEEDED` = tethered. `RUNNING` = still tethering (normal for up to 25 minutes).
+`healthy` = bootstrapped and serving. `initial` or `unhealthy` for less than 10 minutes after
+launch is normal while `nsbootstrap` runs. There is no orchestration service to inspect —
+`nsbootstrap.service` runs on the appliance itself.
 
 **4. DLP On Demand instances in service:**
 ```bash

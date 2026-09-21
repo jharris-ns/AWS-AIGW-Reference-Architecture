@@ -26,6 +26,7 @@ docs/SSH_TUNNEL_PROPOSAL.md
 docs/TUI_ENROLLMENT_PLAN.md
 
 # Dev-only scripts and templates
+templates/gateway-combined-demo.yaml
 scripts/lambda_function.py
 scripts/lambda_tui_test.py
 scripts/test-ssh-tunnel.py
@@ -48,3 +49,4 @@ libs/tui/base_test.py
 libs/tui/utils/__init__.py
 libs/tui/utils/enrollment.py
 libs/tui/utils/csr.py
+/dlpod/docs/DataSecurityTeam-Support bootstrap for zero touch inital configuration in DLPoD Appliance-250826-165246.pdf

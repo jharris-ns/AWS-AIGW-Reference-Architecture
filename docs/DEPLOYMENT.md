@@ -2,9 +2,10 @@
 
 `templates/gateway-combined.yaml` deploys Netskope AI Gateway and DLP On Demand together in a
 single CloudFormation stack. A new VPC is created — no pre-existing networking is required. DLP
-On Demand tethers automatically via SSH/CLI automation. AI Gateway enrolls via native Secrets
-Manager bootstrap, with the DLP On Demand certificate and endpoint already written into the
-bootstrap configuration before any instances launch.
+On Demand configures itself automatically via `nsbootstrap.service` at first boot using EC2
+UserData. AI Gateway enrolls via native Secrets Manager bootstrap, with the DLP On Demand
+certificate and endpoint already written into the bootstrap configuration before any instances
+launch.
 
 ## Table of Contents
 
@@ -22,7 +23,7 @@ bootstrap configuration before any instances launch.
 
 ## Prerequisites
 
-Complete all six items before deploying.
+Complete all five items before deploying.
 
 ### 1. AI Gateway AMI
 
@@ -115,60 +116,24 @@ aws acm import-certificate \
 # → use the output CertificateArn as AcmCertificateArn
 ```
 
-### 5. Lambda Packages in S3
+### 5. AI Guardrails (optional — skip if not using Guardrails)
 
-- [ ] Upload Lambda artifacts to an S3 bucket in your target region.
+- [ ] **Guardrails Docker image in S3** — upload `aisecurity-llm.tgz` (supplied by Netskope) to an
+  S3 bucket in the same region as the stack:
+  ```bash
+  aws s3 mb s3://<bucket> --region <region>          # skip if it already exists
+  aws s3 cp aisecurity-llm.tgz s3://<bucket>/aisecurity-llm.tgz --region <region>
+  ```
 
-**Why this step:** CloudFormation reads Lambda code from S3 at deploy time. The four artifacts
-below must exist in a bucket in **the same region as your stack** before `create-stack` runs.
-Pre-built packages are included in the repository's `dist/` folder — no Docker or build tools
-are needed.
+- [ ] **Deep Learning Base GPU AMI** — find the latest for your region:
+  ```bash
+  aws ec2 describe-images --owners amazon --region <region> \
+    --filters "Name=name,Values=Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 22.04)*" \
+    --query 'sort_by(Images,&CreationDate)[-1].[ImageId,Name]' --output text
+  ```
 
-**Required S3 layout:**
-```
-s3://<bucket>/
-  lambda-activation.zip         # AI Gateway enrollment Lambda
-  lambda-step-function.zip      # Enrollment Step Functions Lambda
-  lambda-dlpod.zip              # DLP On Demand tethering Lambda
-  layers/
-    pexpect-layer.zip           # paramiko + pyte Lambda layer (x86_64 Linux)
-```
-
-#### Option A — Script
-
-```bash
-scripts/deploy-artifacts.sh <region>
-```
-
-Creates a bucket named `netskope-aigw-templates-<account-id>` (override with
-`LAMBDA_BUCKET=<name>`), uploads all four pre-built artifacts from `dist/`, and prints the bucket
-name at the end.
-
-> **Rebuild from source:** Set `REBUILD=1` to rebuild all packages locally instead of using
-> pre-built artifacts. The Lambda layer build requires Docker or Podman:
-> `REBUILD=1 scripts/deploy-artifacts.sh <region>`
-
-#### Option B — Manual (S3 Console)
-
-**1. Create the bucket** — Open the [S3 Console](https://s3.console.aws.amazon.com/s3/), click
-**Create bucket**, and set:
-- **Bucket name:** `netskope-aigw-templates-<account-id>` (your 12-digit AWS account ID)
-- **Region:** Your target deployment region
-- Leave **Block Public Access** fully enabled (default)
-
-**2. Upload the function packages** — Open the bucket. Click **Upload** → **Add files** and
-select these three files from the repository:
-- `dist/lambda-activation.zip`
-- `dist/lambda-step-function.zip`
-- `dist/lambda-dlpod.zip`
-
-Click **Upload**. These go in the bucket root.
-
-**3. Upload the Lambda layer** — Click **Create folder**, name it `layers`, click **Create
-folder**. Open `layers/`, click **Upload** → **Add files**, select `dist/pexpect-layer.zip`,
-click **Upload**.
-
-Note the bucket name — it is required as the `LambdaCodeBucket` stack parameter.
+- [ ] **GPU instance quota** — AWS Console → Service Quotas → Amazon EC2 → search
+  "Running On-Demand G and VT instances". Minimum **4 vCPU** for `g4dn.xlarge` (default).
 
 ### 6. AWS Permissions
 
@@ -209,12 +174,6 @@ Note the bucket name — it is required as the `LambdaCodeBucket` stack paramete
       "Sid": "Lambda",
       "Effect": "Allow",
       "Action": "lambda:*",
-      "Resource": "*"
-    },
-    {
-      "Sid": "StepFunctions",
-      "Effect": "Allow",
-      "Action": "states:*",
       "Resource": "*"
     },
     {
@@ -339,11 +298,8 @@ curl -sf -o /dev/null -w "HTTP %{http_code}\n" \
   -H "Netskope-Api-Token: $NETSKOPE_API_TOKEN" \
   https://<tenant>.goskope.com/api/v2/aig/appliances
 
-# Verify Lambda packages are in S3
-aws s3 ls s3://<bucket>/lambda-activation.zip --region <region>
-aws s3 ls s3://<bucket>/lambda-step-function.zip --region <region>
-aws s3 ls s3://<bucket>/lambda-dlpod.zip --region <region>
-aws s3 ls s3://<bucket>/layers/pexpect-layer.zip --region <region>
+# Verify the template S3 bucket exists
+aws s3api head-bucket --bucket <bucket> 2>/dev/null && echo "Bucket exists" || echo "Bucket missing — run scripts/deploy-artifacts.sh <region>"
 ```
 
 ---
@@ -375,35 +331,50 @@ aws s3 ls s3://<bucket>/layers/pexpect-layer.zip --region <region>
 | `DlpodInstanceType` | String | `c5a.4xlarge` | No | Allowed: `c5a.4xlarge`, `c5a.8xlarge`, `c5a.16xlarge`, `c5ad.4xlarge`, `c5ad.8xlarge`, `c5ad.16xlarge`. |
 | `DlpodLicenseKey` | String (NoEcho) | — | Yes | DLP On Demand license key. |
 | `DlpodDesiredCapacity` | Number | `1` | No | Desired DLP On Demand instances (1–4). ASG min is fixed at 1, max at 4. |
-| `DlpDomainName` | String | `dlp.aigw.internal` | No | Private DNS name for the DLP On Demand internal ALB. |
+
+The DLP On Demand service name is fixed at `dlp.aigw.internal` (private hosted zone `aigw.internal`).
+
+### AI Guardrails (optional)
+
+The Guardrails tier is deployed only when `GuardrailsImageS3Bucket` is set. Leave it empty for the
+standard AIG + DLPoD deployment. When enabled, the AIG bootstrap secret gains an
+`ai_guardrails.host` entry pointing at `http://guardrails.aigw.internal:<port>/invocations` and
+no AIG instance launches until the Guardrails ALB reports every target healthy.
+
+| Parameter | Type | Default | Required | Description |
+|---|---|---|---|---|
+| `GuardrailsImageS3Bucket` | String | `''` (disabled) | No | S3 bucket holding the Netskope `aisecurity-llm.tgz` Docker image tarball. Must be in the same region as the stack. Empty disables the tier. |
+| `GuardrailsImageS3Key` | String | `aisecurity-llm.tgz` | No | Object key of the tarball (a `docker save` archive). |
+| `GuardrailsAmiId` | String | `''` | Yes, if bucket set | AWS Deep Learning Base GPU AMI (Ubuntu 22.04) — ships NVIDIA driver, Docker and NVIDIA Container Toolkit. Enforced by a template `Rules` assertion. |
+| `GuardrailsInstanceType` | String | `g4dn.xlarge` | No | Allowed: `g4dn.xlarge`, `g4dn.2xlarge`, `g5.xlarge`, `g5.2xlarge`. Needs "Running On-Demand G and VT instances" quota ≥ 4 vCPU per instance. |
+| `GuardrailsDesiredCapacity` | Number | `1` | No | Desired Guardrails instances (1–4). |
+| `GuardrailsContainerPort` | Number | `8080` | No | Container port; also the internal ALB listener port. |
+| `GuardrailsHealthCheckPath` | String | `/ping` | No | ALB health check path (expects HTTP 200). |
+
+**Finding the Deep Learning Base GPU AMI for your region:**
+```bash
+aws ec2 describe-images --owners amazon --region <region> \
+  --filters "Name=name,Values=Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 22.04)*" \
+  --query 'sort_by(Images,&CreationDate)[-1].[ImageId,Name]' --output text
+```
+
+**Uploading the Guardrails image tarball to S3** (same procedure as the Terraform POV):
+```bash
+aws s3 mb s3://<bucket> --region <region>          # skip if it already exists; must be in the stack's region
+aws s3 cp aisecurity-llm.tgz s3://<bucket>/aisecurity-llm.tgz --region <region>
+```
+The tarball is supplied by Netskope. At first boot each Guardrails instance downloads it, runs
+`docker load`, and starts the image tag reported by `docker load`.
 
 ### VPC
 
-The template creates a new VPC. All CIDR parameters have sensible defaults.
+The template creates a new VPC. Four `/24` subnets (two public, two private, across two AZs) are
+derived automatically from `VpcCidr` with `Fn::Cidr`; instances use the Amazon-provided DNS
+resolver (`169.254.169.253`), so no DNS or subnet parameters are needed.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `VpcCidr` | String | `10.0.0.0/16` | CIDR for the new VPC. |
-| `DnsServer` | String | `10.0.0.2` | VPC DNS resolver — always VPC base address + 2. Override when changing `VpcCidr`. |
-| `PublicSubnet1Cidr` | String | `10.0.1.0/24` | Public subnet AZ 1 (AI Gateway ALB + NAT gateway). |
-| `PublicSubnet2Cidr` | String | `10.0.2.0/24` | Public subnet AZ 2 (AI Gateway ALB). |
-| `PrivateSubnet1Cidr` | String | `10.0.10.0/24` | Private subnet AZ 1 (AI Gateway + DLP On Demand instances + DLP On Demand internal ALB). |
-| `PrivateSubnet2Cidr` | String | `10.0.11.0/24` | Private subnet AZ 2. |
-
-### Lambda code (S3)
-
-| Parameter | Type | Default | Required | Description |
-|---|---|---|---|---|
-| `LambdaCodeBucket` | String | — | Yes | S3 bucket containing Lambda artifacts. Must be in the same region as the stack. |
-| `DlpodLambdaCodeKey` | String | `lambda-dlpod.zip` | No | S3 key for the DLP On Demand tethering Lambda package. |
-| `LambdaLayerKey` | String | `layers/pexpect-layer.zip` | No | S3 key for the paramiko/pyte Lambda layer. |
-
-### Tags
-
-| Parameter | Type | Default | Required | Description |
-|---|---|---|---|---|
-| `Project` | String | — | Yes | Lowercase alphanumeric tag value. |
-| `Environment` | String | — | Yes | `dev`, `staging`, or `prod`. |
+| `VpcCidr` | String | `10.0.0.0/16` | CIDR for the new VPC. Must be large enough for four `/24` subnets. |
 
 ---
 
@@ -412,8 +383,8 @@ The template creates a new VPC. All CIDR parameters have sensible defaults.
 **Why this step:** CloudFormation reads the template from S3 because it exceeds the 51 KB limit
 for direct upload. The template URL tells CloudFormation where to find it. Once submitted,
 CloudFormation provisions all resources in the correct dependency order automatically — VPC,
-subnets, security groups, IAM roles, Lambda functions, ASGs — and wires up the lifecycle hooks
-that trigger enrollment and tethering when each instance launches.
+subnets, security groups, IAM roles, Lambda functions, and ASGs. DLPoD instances self-configure
+at first boot via `nsbootstrap.service`; AIG instances self-enroll at first boot via Secrets Manager.
 
 ### Option A — AWS CLI
 
@@ -430,9 +401,7 @@ aws cloudformation create-stack \
     ParameterKey=NetskopeTenantUrl,ParameterValue=https://tenant.goskope.com \
     ParameterKey=NetskopeApiToken,ParameterValue=<token> \
     ParameterKey=DlpodLicenseKey,ParameterValue=<license-key> \
-    ParameterKey=LambdaCodeBucket,ParameterValue=<bucket> \
-    ParameterKey=Project,ParameterValue=aigw \
-    ParameterKey=Environment,ParameterValue=prod \
+  --tags Key=Project,Value=aigw Key=Environment,Value=prod Key=ManagedBy,Value=CloudFormation \
   --capabilities CAPABILITY_NAMED_IAM \
   --region <region>
 
@@ -441,13 +410,16 @@ aws cloudformation create-stack \
 ```
 
 All other parameters take their defaults. Override `GatewayAmiId` and `DlpodAmiId` when
-deploying outside us-west-1.
+deploying outside us-west-1. `Project` and `Environment` are not template parameters — pass them
+as `--tags` (shown above) so they propagate to all stack resources.
 
 ### Option B — AWS Console
 
-**1. Upload the template to S3** — In your Lambda artifacts bucket from Prerequisites step 5,
+**1. Upload the template to S3** — In your S3 bucket (`netskope-aigw-templates-<account-id>`),
 click **Create folder**, name it `templates`, open the folder, click **Upload** → **Add files**,
 and select `templates/gateway-combined.yaml` from this repository. Click **Upload**.
+
+If the bucket does not exist yet, run `scripts/deploy-artifacts.sh <region>` to create it.
 
 Your template URL will be:
 ```
@@ -469,15 +441,13 @@ click **Next**.
 | `NetskopeTenantUrl` | `https://<tenant>.goskope.com` |
 | `NetskopeApiToken` | Your RBAC v3 API token |
 | `DlpodLicenseKey` | Your DLP On Demand license key |
-| `LambdaCodeBucket` | Bucket name from Prerequisites step 5 |
-| `Project` | Lowercase label, e.g. `aigw` |
-| `Environment` | `dev`, `staging`, or `prod` |
 
 Leave all other parameters at their defaults. Leave `AcmCertificateArn` blank to auto-generate
 a self-signed certificate. Override `GatewayAmiId` and `DlpodAmiId` for regions other than
 us-west-1.
 
-**5. Configure options** — No changes required. Click **Next**.
+**5. Configure options** — Under **Tags**, add `Project`, `Environment`, and `ManagedBy` tags
+(e.g. `aigw`, `prod`, `CloudFormation`). These propagate to all stack resources. Click **Next**.
 
 **6. Review and submit** — On the review page scroll to the bottom and check:
 
@@ -493,15 +463,15 @@ aws cloudformation describe-stacks \
   --query 'Stacks[0].StackStatus' --output text --region <region>
 ```
 
-Stack resource creation takes approximately **12–18 minutes**. The DLP On Demand ASG is the last
-resource created — CloudFormation waits for tethering to complete and the instance to become
-ALB-healthy before marking the stack `CREATE_COMPLETE`. Both enrollment flows run concurrently
-once instances launch:
+Stack resource creation takes approximately **12–18 minutes**. DLP On Demand instances launch
+first; `DlpodReadinessGate` waits (up to 14 minutes) for every DLP On Demand target to be
+ALB-healthy, and only then does the AI Gateway ASG create instances. `CREATE_COMPLETE` is
+reported once all resources exist — AI Gateway enrollment finishes shortly after.
 
 | Service | Time to load balancer healthy | What's happening |
 |---|---|---|
-| AI Gateway | 5–15 min from instance launch | Reads bootstrap secret at boot and self-enrolls autonomously |
-| DLP On Demand | 10–20 min from instance launch | SSH-based tethering automation via Step Functions |
+| DLP On Demand | 5–10 min from instance launch | `nsbootstrap.service` applies `bootstrap.json` from UserData (TLS cert, license, DNS) |
+| AI Gateway | 5–15 min from instance launch | Lifecycle hook → Activation Lambda registers appliance; instance reads bootstrap secret at boot and self-enrolls |
 
 DLP forwarding becomes active once at least one AI Gateway instance and one DLP On Demand
 instance are both load balancer healthy.
@@ -520,15 +490,22 @@ Gateway bootstrap secret before any AI Gateway instance can launch:
    → Writes PEM to SSM /<stack>/dlpod-cert
    → Pre-populates AIG bootstrap secret with DLP block {certificate, host}
 
-2. GatewayAutoScalingGroup and DlpodAutoScalingGroup launch concurrently
-   AIG (DependsOn DlpodAlbCertificate):
+2. DlpodBootstrapResource custom resource assembles bootstrap.json UserData (cert + key + license key)
+   DlpodAutoScalingGroup launches DLPoD instances:
+   → nsbootstrap.service applies TLS certs, license, DNS, and persona at first boot
+   → DlpodReadinessGate polls ALB target health (up to 14 min) before allowing AIG to launch
+
+2b. (Optional, when GuardrailsImageS3Bucket is set — runs in parallel with step 2)
+   GuardrailsAutoScalingGroup launches GPU instances:
+   → UserData downloads the tarball from S3, `docker load`s it, starts the container on the configured port
+   → GuardrailsReadinessGate polls the Guardrails ALB target group (up to 14 min)
+
+3. GatewayAutoScalingGroup launches AIG instances (DependsOn DlpodReadinessGate, and
+   GuardrailsReadinessGate via a !Ref when Guardrails is deployed):
    → Activation Lambda registers with Netskope API, writes enrollment token to bootstrap secret
-   → AI Gateway reads bootstrap secret at boot: enrolls + configures DLP forwarding
+     (plus ai_guardrails.host when Guardrails is deployed)
+   → AI Gateway reads bootstrap secret at boot: enrolls + configures DLP (and Guardrails) forwarding
    → DLP forwarding is active from first AI Gateway boot
-   DLPoD:
-   → Each instance: SNS → DlpodActivationFunction → Step Functions tethering
-   → ~10–20 minutes to tether and become load balancer healthy
-   → DLP traffic fails gracefully until DLP On Demand tethering completes
 ```
 
 ---
@@ -544,19 +521,22 @@ aws cloudformation describe-stacks --stack-name <stack-name> \
 
 Expect `CREATE_COMPLETE`.
 
-### 2. DLP On Demand tethering
+### 2. DLP On Demand bootstrap
 
 ```bash
-SFN_ARN=$(aws cloudformation describe-stacks --stack-name <stack-name> \
-  --query "Stacks[0].Outputs[?OutputKey=='DlpodTetheringStateMachineArn'].OutputValue" \
-  --output text --region <region>)
+# nsbootstrap progress (on the instance via SSM Session Manager)
+journalctl -u nsbootstrap.service --no-pager
 
-aws stepfunctions list-executions --state-machine-arn "$SFN_ARN" \
-  --query "executions[*].[name,status,startDate]" \
+# ALB target health — healthy means nsbootstrap completed and HTTPS is serving
+TG_ARN=$(aws elbv2 describe-target-groups \
+  --query "TargetGroups[?contains(TargetGroupName,'<stack-name>-dlpod-tg')].TargetGroupArn" \
+  --output text --region <region>)
+aws elbv2 describe-target-health --target-group-arn "$TG_ARN" \
+  --query "TargetHealthDescriptions[*].[Target.Id,TargetHealth.State]" \
   --output table --region <region>
 ```
 
-`SUCCEEDED` = tethered. `RUNNING` = in progress (normal for up to 25 minutes).
+`healthy` = nsbootstrap completed and DLP On Demand is serving HTTPS on port 443.
 
 ### 3. DLP On Demand ASG state
 
@@ -567,7 +547,7 @@ aws autoscaling describe-auto-scaling-groups \
   --output table --region <region>
 ```
 
-`InService` / `Healthy` means tethered and load balancer healthy.
+`InService` / `Healthy` means bootstrap completed and load balancer healthy.
 
 ### 4. AI Gateway bootstrap secret
 
@@ -617,10 +597,11 @@ aws elbv2 describe-target-health --target-group-arn "$TG_ARN" \
 | `AigActivationLogGroup` | AI Gateway activation Lambda log group |
 | `AigScaleOutAlarmName` | CloudWatch alarm that triggers AI Gateway scale-out |
 | `DlpodServiceUrl` | DLP On Demand private HTTPS URL (`https://dlp.aigw.internal`) |
-| `DlpodCertParameterName` | SSM parameter containing the DLP On Demand ALB self-signed cert PEM |
-| `DlpodTetheringStateMachineArn` | DLP On Demand tethering Step Functions ARN |
-| `DlpodActivationLogGroup` | DLP On Demand activation Lambda log group |
-| `DlpodLambdaLogGroup` | DLP On Demand tethering Lambda log group |
+| `DlpodCertParameterName` | SSM parameter containing the DLP On Demand CA certificate PEM |
+| `DlpodBootstrapLogGroup` | DLP On Demand bootstrap builder Lambda log group |
+| `GuardrailsServiceUrl` | *(Guardrails only)* Inference URL written to the bootstrap secret as `ai_guardrails.host` |
+| `GuardrailsAlbDnsName` | *(Guardrails only)* Guardrails internal ALB DNS name |
+| `GuardrailsAutoScalingGroupName` | *(Guardrails only)* Guardrails ASG name |
 | `VpcId` | VPC ID |
 
 **Retrieve all outputs at once:**
@@ -641,7 +622,6 @@ aws cloudformation update-stack \
   --parameters \
     ParameterKey=NetskopeApiToken,UsePreviousValue=true \
     ParameterKey=DlpodLicenseKey,UsePreviousValue=true \
-    ParameterKey=LambdaCodeBucket,UsePreviousValue=true \
     ParameterKey=AcmCertificateArn,UsePreviousValue=true \
     ParameterKey=<changed-parameter>,ParameterValue=<new-value> \
   --capabilities CAPABILITY_NAMED_IAM \
@@ -650,7 +630,7 @@ aws cloudformation update-stack \
 
 Changing `GatewayAmiId` triggers an AI Gateway ASG instance refresh — each replaced instance
 re-enrolls autonomously. Changing `DlpodAmiId` triggers a DLP On Demand ASG instance refresh —
-each replaced instance goes through full tethering. See [OPERATIONS.md — AMI Upgrade Procedure](OPERATIONS.md#ami-upgrade-procedure)
+each replaced instance re-runs `nsbootstrap` from its UserData. See [OPERATIONS.md — AMI Upgrade Procedure](OPERATIONS.md#ami-upgrade-procedure)
 for the step-by-step upgrade process.
 
 ---
@@ -661,8 +641,7 @@ for the step-by-step upgrade process.
 aws cloudformation delete-stack --stack-name <stack-name> --region <region>
 ```
 
-Deletes both ASGs (lifecycle hooks fire and complete gracefully), both ALBs, all Lambda functions,
-the DLP On Demand tethering Step Functions state machine, Route 53 hosted zone, ACM certificate
+Deletes both ASGs, both ALBs, all Lambda functions, Route 53 hosted zone, ACM certificate
 (DLP On Demand ALB), IAM roles, Secrets Manager secrets, SSM parameters, and the entire VPC with
 subnets and NAT gateway.
 

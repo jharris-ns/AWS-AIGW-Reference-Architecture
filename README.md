@@ -28,7 +28,7 @@ integrating into an existing environment.
 | [aig/docs/DEPLOYMENT.md](aig/docs/DEPLOYMENT.md) | AI Gateway-only: prerequisites, ACM cert, deploy options, verification |
 | [aig/docs/OPERATIONS.md](aig/docs/OPERATIONS.md) | AI Gateway-only: enrollment flow, scaling, troubleshooting |
 | [dlpod/docs/DEPLOYMENT.md](dlpod/docs/DEPLOYMENT.md) | DLP On Demand-only: prerequisites, Lambda artifacts, deploy options, verification |
-| [dlpod/docs/OPERATIONS.md](dlpod/docs/OPERATIONS.md) | DLP On Demand-only: tethering flow, scaling, troubleshooting |
+| [dlpod/docs/OPERATIONS.md](dlpod/docs/OPERATIONS.md) | DLP On Demand-only: nsbootstrap flow, scaling, troubleshooting |
 
 ---
 
@@ -64,7 +64,9 @@ OpenAI-compatible API regardless of the upstream model.
 
 **Advanced guardrails (optional):** A GPU-backed Auto Scaling Group running Netskope's
 `aisecurityllm` container provides ML-based prompt injection and content safety classification.
-The model runs entirely within your VPC on NVIDIA GPU instances (g4dn or g5 family).
+The model runs entirely within your VPC on NVIDIA GPU instances (g4dn or g5 family), behind an
+internal ALB at `guardrails.aigw.internal`. Enable it in the combined template by setting
+`GuardrailsImageS3Bucket` (S3 bucket holding the `aisecurity-llm.tgz` tarball) and `GuardrailsAmiId`; AIG is wired to it automatically at enrollment.
 
 ---
 
@@ -93,19 +95,18 @@ immediately. No manual coordination between the two services is required.
 | Service | Purpose |
 |---|---|
 | **EC2** | AI Gateway and DLP On Demand instances |
-| **Auto Scaling** | Instance lifecycle management with launch hooks for both services |
+| **Auto Scaling** | Instance lifecycle management; launch/terminate hooks on the AI Gateway ASG only |
 | **Elastic Load Balancing** | Internet-facing ALB (AI Gateway) and internal ALB (DLP On Demand) |
 | **VPC** | Isolated network: public subnets (ALBs, NAT Gateway), private subnets (instances) |
-| **Lambda** | AI Gateway activation/deregistration; DLP On Demand tethering steps; cert generation |
-| **Step Functions** | Orchestrates DLP On Demand SSH-based tethering automation |
+| **Lambda** | Four inline functions: AI Gateway activation/deregistration, cert generation, DLP On Demand `bootstrap.json` builder, ALB readiness gate |
 | **SNS** | Delivers Auto Scaling lifecycle events to Lambda functions |
-| **Secrets Manager** | AI Gateway bootstrap secret, Netskope API credentials, DLP On Demand license key |
+| **Secrets Manager** | AI Gateway bootstrap secret, Netskope API credentials, DLP On Demand license key, DLP On Demand TLS key |
 | **Systems Manager Parameter Store** | DLP On Demand ALB certificate PEM, AI Gateway appliance IDs |
 | **ACM** | TLS certificates — auto-generated for both ALBs, or user-provided for the AI Gateway ALB |
-| **Route 53** | Private hosted zone (`aigw.internal`) for DLP On Demand internal DNS |
-| **CloudWatch Logs** | Lambda and instance log groups |
+| **Route 53** | Private hosted zone (`aigw.internal`) for DLP On Demand and optional Guardrails internal DNS |
+| **CloudWatch Logs** | Lambda log groups |
 | **IAM** | Instance profiles, Lambda execution roles, lifecycle SNS publishing roles |
-| **S3** | Lambda deployment packages and Lambda layer (paramiko/pyte) |
+| **S3** | Hosts the template for `--template-url` (the combined template exceeds the 51 KB direct-upload limit) |
 
 ---
 
@@ -121,7 +122,6 @@ provisions. Required permissions:
 | Elastic Load Balancing | `elasticloadbalancing:*` |
 | Auto Scaling | `autoscaling:*` |
 | Lambda | `lambda:*` |
-| Step Functions | `states:*` |
 | SNS | `sns:*` |
 | Secrets Manager | `secretsmanager:*` |
 | SSM | `ssm:PutParameter`, `ssm:GetParameter`, `ssm:DeleteParameter`, `ssm:AddTagsToResource` |
@@ -168,12 +168,6 @@ provisions. Required permissions:
       "Sid": "Lambda",
       "Effect": "Allow",
       "Action": "lambda:*",
-      "Resource": "*"
-    },
-    {
-      "Sid": "StepFunctions",
-      "Effect": "Allow",
-      "Action": "states:*",
       "Resource": "*"
     },
     {
@@ -330,7 +324,7 @@ See [ARCHITECTURE.md — Cost Estimate](docs/ARCHITECTURE.md#cost-estimate) for 
 | [docs/SECURITY.md](docs/SECURITY.md) | InfoSec | IAM least privilege, secrets handling, encryption, CFN security practices |
 | [docs/OPERATIONS.md](docs/OPERATIONS.md) | DevOps Engineer | Startup sequence, scaling, monitoring, log groups, AMI upgrade |
 | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | DevOps Engineer | Issue/Cause/Solution format with log patterns |
-| [docs/Automated_Bootstrap_Using_AWS_Secrets_Manager.pdf](docs/Automated_Bootstrap_Using_AWS_Secrets_Manager.pdf) | Developer | AI Gateway bootstrap secret payload schema |
+| [CLAUDE_DEV.md](CLAUDE_DEV.md) | Developer | Template conventions, resource inventory, development rules |
 
 ---
 
@@ -339,11 +333,11 @@ See [ARCHITECTURE.md — Cost Estimate](docs/ARCHITECTURE.md#cost-estimate) for 
 | Term | Definition |
 |---|---|
 | **Enrollment token** | One-time token generated by the Netskope API during appliance registration. Passed to the AI Gateway instance via Secrets Manager at boot. |
-| **Tethering** | The process by which a DLP On Demand instance connects to the Netskope management plane to receive its configuration and license. |
+| **Bootstrap (DLP On Demand)** | First-boot configuration by `nsbootstrap.service` from a `bootstrap.json` delivered in EC2 UserData — TLS certificate and key, license key, DNS server and persona. No SSH or orchestration is involved. |
 | **Bootstrap secret** | AWS Secrets Manager secret read by the AI Gateway at boot. Contains the enrollment token and the DLP On Demand endpoint and certificate. |
-| **Lifecycle hook** | Auto Scaling mechanism that holds an instance in a wait state while automation runs. AI Gateway hook timeout: 120 s. DLP On Demand hook timeout: 1800 s. |
+| **Lifecycle hook** | Auto Scaling mechanism that holds an instance in a wait state while automation runs. Used on the AI Gateway ASG only (120 s heartbeat). DLP On Demand and Guardrails rely on ALB health checks instead. |
 | **Management plane** | Netskope's cloud-hosted control plane. Appliances register with it to receive security policies, configuration updates, and DLP profiles. |
-| **nsadmin** | Default SSH user on both AI Gateway and DLP On Demand appliances. |
+| **Readiness gate** | Custom resource that polls an ALB target group and blocks the AI Gateway ASG from launching until DLP On Demand (and Guardrails, if deployed) targets are healthy. |
 
 ---
 

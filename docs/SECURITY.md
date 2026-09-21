@@ -18,19 +18,27 @@ security architects, and compliance teams evaluating this deployment.
 
 ## Security Design Principles
 
-1. **Least privilege IAM** — Nine dedicated IAM roles; each has exactly the permissions its function
-   requires. No wildcards on resource ARNs for sensitive operations.
+1. **Least privilege IAM** — Seven dedicated IAM roles (eight when the optional Guardrails tier is
+   deployed); each has exactly the permissions its function requires. Secrets Manager, SSM, and
+   Auto Scaling actions are scoped to specific resource ARNs.
 
 2. **Secrets never touch instances directly** — The Netskope API token flows from Secrets Manager
-   to the Activation Lambda only (in memory). The Lambda exchanges the token for a short-lived
-   enrollment token, which it writes to the bootstrap secret. Instances read the bootstrap secret
-   at boot — they never have access to the raw API token.
+   to the AIG Activation Lambda only (in memory). The Lambda exchanges the token for a short-lived
+   enrollment token, which it writes to the bootstrap secret. AIG instances read the bootstrap
+   secret at boot — they never have access to the raw API token. DLPoD instances read no secret
+   at all: their configuration is assembled once at stack creation by an inline Lambda and
+   delivered as launch template UserData.
 
 3. **No public IP on compute** — All EC2 instances run in private subnets. Inbound access is
-   exclusively through the ALBs. There is no SSH inbound path from the internet to any instance.
+   exclusively through the ALBs. There is no SSH inbound path to any instance — from the internet
+   or from inside the VPC. No security group in the stack opens port 22.
 
 4. **All sensitive parameters are `NoEcho`** — `NetskopeApiToken` and `DlpodLicenseKey` are
    never shown in CloudFormation events, stack outputs, or the console after submission.
+
+5. **No orchestration or remote-login automation** — DLPoD configures itself from `bootstrap.json`
+   via its own `nsbootstrap.service` at first boot. There is no orchestration service, no
+   remote-login automation, and no lifecycle hook on the DLPoD Auto Scaling Group.
 
 ---
 
@@ -43,48 +51,62 @@ security architects, and compliance teams evaluating this deployment.
 | Direction | Protocol | Port | Source / Destination | Purpose |
 |---|---|---|---|---|
 | Inbound | TCP | 443 | `0.0.0.0/0` | HTTPS from internet clients |
-| Outbound | TCP | 443 | AIG Instance SG | Forward to AIG instances |
+| Outbound | TCP | 443 | VPC CIDR | Forward to AIG instances |
 
-**AIG Instance Security Group** (`<stack>-aig-sg`)
+**AIG Instance Security Group** (`<stack>-aig-gw-sg`)
 
 | Direction | Protocol | Port | Source / Destination | Purpose |
 |---|---|---|---|---|
 | Inbound | TCP | 443 | AIG ALB SG | HTTPS from ALB only |
-| Outbound | All | All | `0.0.0.0/0` | Outbound via NAT GW (Netskope API, LLM providers, DLPoD ALB) |
+| Outbound | All | All | `0.0.0.0/0` | Outbound via NAT GW (Netskope API, LLM providers, DLPoD ALB, Guardrails ALB) |
 
 **DLPoD ALB Security Group** (`<stack>-dlpod-alb-sg`)
 
 | Direction | Protocol | Port | Source / Destination | Purpose |
 |---|---|---|---|---|
-| Inbound | TCP | 443 | AIG Instance SG | HTTPS from AIG instances only |
-| Outbound | TCP | 443 | DLPoD Instance SG | Forward to DLPoD instances |
+| Inbound | TCP | 443 | AIG Instance SG | HTTPS from AIG instances only (`AigToDlpodAlbIngress`) |
+| Outbound | TCP | 443 | VPC CIDR | Forward to DLPoD instances |
 
 **DLPoD Instance Security Group** (`<stack>-dlpod-sg`)
 
 | Direction | Protocol | Port | Source / Destination | Purpose |
 |---|---|---|---|---|
-| Inbound | TCP | 443 | DLPoD ALB SG | HTTPS for DLP inspection |
-| Inbound | TCP | 22 | DLPoD Lambda SG | SSH for tethering automation only |
-| Outbound | All | All | `0.0.0.0/0` | Tethering callhome via NAT GW |
+| Inbound | TCP | 443 | DLPoD ALB SG | HTTPS for DLP inspection (only ingress rule — no SSH) |
+| Outbound | All | All | `0.0.0.0/0` | Netskope management plane connection via NAT GW |
 
-**DLPoD Lambda Security Group** (`<stack>-dlpod-lambda-sg`)
+There is no Lambda security group: none of the stack's four Lambda functions is VPC-attached.
+They call AWS APIs (ACM, SSM, Secrets Manager, ELBv2, Auto Scaling, EC2) and the Netskope REST
+API over the public Lambda network path only.
+
+**Guardrails ALB Security Group** (`<stack>-guardrails-alb-sg`) — *only when Guardrails is deployed*
 
 | Direction | Protocol | Port | Source / Destination | Purpose |
 |---|---|---|---|---|
-| Outbound | TCP | 22 | DLPoD Instance SG | SSH for tethering |
-| Outbound | TCP | 443 | DLPoD Instance SG | HTTPS for tethering status checks |
+| Inbound | TCP | `GuardrailsContainerPort` (8080) | AIG Instance SG | HTTP inference requests from AIG instances only |
+| Outbound | TCP | `GuardrailsContainerPort` (8080) | VPC CIDR | Forward to Guardrails instances |
+
+**Guardrails Instance Security Group** (`<stack>-guardrails-sg`) — *only when Guardrails is deployed*
+
+| Direction | Protocol | Port | Source / Destination | Purpose |
+|---|---|---|---|---|
+| Inbound | TCP | `GuardrailsContainerPort` (8080) | Guardrails ALB SG | HTTP from ALB only |
+| Outbound | All | All | `0.0.0.0/0` | S3 image download via NAT GW |
 
 ### Network Isolation
 
 - **No direct internet inbound to instances.** The internet-facing AIG ALB is the only inbound
   internet path. It terminates TLS and forwards to AIG instances in private subnets.
 - **DLPoD is fully internal.** The DLPoD ALB is internal-only (private subnets). DLPoD instances
-  are reachable only from the DLPoD ALB (DLP inspection) and the DLPoD Lambda (tethering).
-- **Outbound internet via NAT Gateway only.** All instance and Lambda outbound internet traffic
-  traverses the single NAT Gateway. There is no direct internet gateway route to private subnets.
+  are reachable only from the DLPoD ALB on port 443 — nothing else in the stack can connect to
+  them.
+- **Outbound internet via NAT Gateway only.** All instance outbound internet traffic traverses
+  the single NAT Gateway. There is no direct internet gateway route to private subnets. An S3
+  Gateway Endpoint routes S3 traffic via the AWS backbone (no NAT Gateway traversal).
 - **AIG → DLPoD via private DNS.** AIG instances resolve `dlp.aigw.internal` via a Route 53
   private hosted zone — this alias always resolves to the DLPoD internal ALB, never to a public
-  address.
+  address. DLPoD instances use the Route 53 Resolver (`169.254.169.253`) set in `bootstrap.json`.
+- **IMDSv2 enforced.** All three launch templates set `HttpTokens: required`, so instance
+  credentials cannot be retrieved with unauthenticated IMDSv1 requests.
 
 ---
 
@@ -94,52 +116,67 @@ security architects, and compliance teams evaluating this deployment.
 
 | Role | Assumed by | Purpose |
 |---|---|---|
-| `<stack>-aig-role` | `ec2.amazonaws.com` | AIG instance profile |
-| `<stack>-aig-activation-role` | `lambda.amazonaws.com` | AIG lifecycle management |
-| `<stack>-aig-lifecycle-sns-role` | `autoscaling.amazonaws.com` | AIG lifecycle event delivery |
-| `<stack>-dlpod-role` | `ec2.amazonaws.com` | DLPoD instance profile |
-| `<stack>-dlpod-activation-role` | `lambda.amazonaws.com` | DLPoD lifecycle initiation |
-| `<stack>-dlpod-sfn-role` | `states.amazonaws.com` | Step Functions → Lambda invocation |
-| `<stack>-dlpod-lambda-role` | `lambda.amazonaws.com` | DLPoD tethering (VPC-attached) |
-| `<stack>-dlpod-lifecycle-sns-role` | `autoscaling.amazonaws.com` | DLPoD lifecycle event delivery |
-| `<stack>-cert-generator-role` | `lambda.amazonaws.com` | Self-signed cert generation |
+| `<stack>-gateway-role` | `ec2.amazonaws.com` | AIG instance profile |
+| `<stack>-aig-activation-role` | `lambda.amazonaws.com` | AIG lifecycle management (enroll / deregister) |
+| `<stack>-aig-lifecycle-sns-role` | `autoscaling.amazonaws.com` | AIG lifecycle event delivery to SNS |
+| `<stack>-dlpod-role` | `ec2.amazonaws.com` | DLPoD instance profile (CloudWatch Agent only) |
+| `<stack>-dlpod-bootstrap-builder-role` | `lambda.amazonaws.com` | Assemble DLPoD `bootstrap.json` UserData at stack create/update |
+| `<stack>-dlpod-readiness-role` | `lambda.amazonaws.com` | Readiness gate — poll ALB target health before AIG launches |
+| `<stack>-certgen-role` | `lambda.amazonaws.com` | Self-signed cert generation (DLPoD ALB, and AIG ALB when auto-generated) |
+| `<stack>-guardrails-role` *(Guardrails only)* | `ec2.amazonaws.com` | Guardrails instance profile (S3 image download, SSM Session Manager, CloudWatch) |
 
 ### Key Principle: AIG Instances Never Hold API Credentials
 
-AIG instances have an IAM role (`<stack>-aig-role`) that allows only two actions:
+AIG instances have an IAM role (`<stack>-gateway-role`) that allows only:
 1. `secretsmanager:GetSecretValue` on the specific bootstrap secret ARN
-2. `logs:*` on the instance's CloudWatch log group
+2. The AWS-managed `CloudWatchAgentServerPolicy` (metrics and logs)
 
-The Netskope API token is in a separate secret (`<stack>-api-credentials`) that the AIG instance
-role has **no access to**. Only the Activation Lambda reads it.
+The Netskope API token is in a separate secret (`<stack>-netskope-credentials`) that the AIG
+instance role has **no access to**. Only the Activation Lambda reads it.
+
+DLPoD instances (`<stack>-dlpod-role`) have **no** Secrets Manager or SSM permissions at all.
 
 ### Role Permissions Detail
 
-**`<stack>-aig-role` (AIG instance profile)**
-- `secretsmanager:GetSecretValue` — bootstrap secret only (ARN-scoped)
-- `logs:CreateLogStream`, `logs:PutLogEvents` — CloudWatch logging
+**`<stack>-gateway-role` (AIG instance profile)**
+- `secretsmanager:GetSecretValue` — `<stack>-aig-bootstrap` only (ARN-scoped)
+- `CloudWatchAgentServerPolicy` (AWS managed) — CloudWatch metrics and logs
 
 **`<stack>-aig-activation-role` (AIG Activation Lambda)**
-- `secretsmanager:GetSecretValue` — `<stack>-api-credentials` (reads API token)
-- `secretsmanager:PutSecretValue` — `<stack>-aig-bootstrap` (writes enrollment token)
-- `ssm:GetParameter` — `/<stack>/dlpod-cert` (reads DLPoD cert for bootstrap secret)
-- `ssm:PutParameter`, `ssm:DeleteParameter` — `/<stack>/appliances/*` (appliance ID tracking)
-- `ec2:DescribeInstances` — describe launching instance to get IP
-- `autoscaling:CompleteLifecycleAction` — complete launch/termination hooks
-- `logs:*` — CloudWatch logging
+- `secretsmanager:GetSecretValue` — `<stack>-netskope-credentials` (reads API token)
+- `secretsmanager:PutSecretValue` — `<stack>-aig-bootstrap` (writes enrollment token + DLP / Guardrails block)
+- `ssm:GetParameter` — `/<stack>/dlpod-cert` (reads DLPoD CA cert for the bootstrap secret)
+- `ssm:PutParameter`, `ssm:GetParameter`, `ssm:DeleteParameter` — `/aig/<stack>/*` (appliance ID tracking)
+- `ec2:DescribeInstances` — describe the launching instance to get its private IP (`Resource: "*"`; EC2 describe calls cannot be ARN-scoped)
+- `autoscaling:CompleteLifecycleAction` — `<stack>-aig-asg` only
+- `logs:CreateLogStream`, `logs:PutLogEvents` — its own log group only
 
-**`<stack>-dlpod-lambda-role` (DLPoD tethering Lambda, VPC-attached)**
+**`<stack>-aig-lifecycle-sns-role` (Auto Scaling → SNS)**
+- `sns:Publish` — `<stack>-aig-lifecycle` topic only
+
+**`<stack>-dlpod-role` (DLPoD instance profile)**
+- `CloudWatchAgentServerPolicy` (AWS managed) — nothing else
+
+**`<stack>-dlpod-bootstrap-builder-role` (DLPoD bootstrap builder custom resource Lambda)**
+- `secretsmanager:GetSecretValue` — `<stack>-dlpod-cert-key` (leaf cert, leaf key, CA cert)
 - `secretsmanager:GetSecretValue` — `<stack>-dlpod-credentials` (license key)
-- `ssm:PutParameter` — `/<stack>/dlpod-cert` (writes cert PEM after generation)
-- `autoscaling:CompleteLifecycleAction` — complete DLPoD launch hook
-- `ec2:CreateNetworkInterface`, `ec2:DescribeNetworkInterfaces`, `ec2:DeleteNetworkInterface` — VPC attachment
-- `logs:*` — CloudWatch logging
+- `logs:CreateLogStream`, `logs:PutLogEvents` — its own log group only
 
-**`<stack>-cert-generator-role` (cert generator custom resource Lambda)**
-- `acm:ImportCertificate`, `acm:DeleteCertificate` — import/delete self-signed certs
-- `ssm:PutParameter`, `ssm:DeleteParameter` — `/<stack>/dlpod-cert`, `/<stack>/aig-cert`
-- `secretsmanager:PutSecretValue` — `<stack>-aig-bootstrap` (pre-populates DLP block)
-- `logs:*` — CloudWatch logging
+**`<stack>-dlpod-readiness-role` (readiness gate custom resource Lambda)**
+- `elasticloadbalancing:DescribeTargetHealth` — `Resource: "*"` (read-only; used for the DLPoD and Guardrails target groups)
+- `logs:CreateLogStream`, `logs:PutLogEvents` — its own log group only
+
+**`<stack>-certgen-role` (cert generator custom resource Lambda)**
+- `acm:ImportCertificate`, `acm:DeleteCertificate`, `acm:AddTagsToCertificate` — `Resource: "*"` (ACM import has no pre-existing ARN to scope to)
+- `ssm:PutParameter` — `/<stack>/*` (`/<stack>/dlpod-cert`, `/<stack>/aig-cert`)
+- `secretsmanager:PutSecretValue` — `<stack>-dlpod-cert-key`
+- `logs:CreateLogStream`, `logs:PutLogEvents` — its own log group only
+
+**`<stack>-guardrails-role` (Guardrails instance profile — only when deployed)**
+- `s3:GetObject` — the single object `arn:aws:s3:::<GuardrailsImageS3Bucket>/<GuardrailsImageS3Key>`
+- `s3:ListBucket` — the bucket, with `s3:prefix` limited to the image key
+- `AmazonSSMManagedInstanceCore` (AWS managed) — Session Manager access for container diagnostics
+- `CloudWatchAgentServerPolicy` (AWS managed)
 
 ---
 
@@ -149,27 +186,49 @@ role has **no access to**. Only the Activation Lambda reads it.
 
 | Secret name | Type | Contents | Who writes | Who reads |
 |---|---|---|---|---|
-| `<stack>-api-credentials` | Secrets Manager | `{"api_token": "...", "tenant_url": "..."}` | CloudFormation (from `NoEcho` parameter) | AIG Activation Lambda only |
-| `<stack>-aig-bootstrap` | Secrets Manager | `{"bootstrap": true, "enrollment_token": "...", "dlp": {"certificate": "...", "host": "..."}}` | Cert generator (DLP block); Activation Lambda (token) | AIG instances at boot |
-| `<stack>-dlpod-credentials` | Secrets Manager | `{"license_key": "..."}` | CloudFormation (from `NoEcho` parameter) | DLPoD tethering Lambda only |
-| `/<stack>/dlpod-cert` | SSM Parameter (SecureString) | PEM-encoded DLPoD ALB self-signed cert | Cert generator Lambda | AIG Activation Lambda |
-| `/<stack>/appliances/<id>` | SSM Parameter | AIG appliance ID in Netskope tenant | AIG Activation Lambda at launch | AIG Activation Lambda at termination |
+| `<stack>-netskope-credentials` | Secrets Manager | `{"tenant_url": "...", "api_token": "..."}` | CloudFormation (from `NoEcho` parameter) | AIG Activation Lambda only |
+| `<stack>-aig-bootstrap` | Secrets Manager | `{"bootstrap": true, "enrollment_token": "...", "dlp": {"certificate": "<CA PEM>", "host": "https://dlp.aigw.internal"}}` plus `"ai_guardrails": {"host": "..."}` when Guardrails is deployed | AIG Activation Lambda (full overwrite at every AIG launch) | AIG instances at boot |
+| `<stack>-dlpod-credentials` | Secrets Manager | `{"license_key": "..."}` | CloudFormation (from `NoEcho` parameter) | DLPoD bootstrap builder Lambda only (stack create/update) |
+| `<stack>-dlpod-cert-key` | Secrets Manager | `{"ca_cert_pem": "...", "leaf_cert_pem": "...", "leaf_key_pem": "..."}` — DLPoD TLS hierarchy incl. leaf private key | Cert generator Lambda | DLPoD bootstrap builder Lambda only |
+| `/<stack>/dlpod-cert` | SSM Parameter (`String`) | PEM-encoded DLPoD CA certificate (public material, 365-day validity) | Cert generator Lambda | AIG Activation Lambda at every AIG launch |
+| `/<stack>/aig-cert` | SSM Parameter (`String`) | PEM-encoded AIG ALB self-signed cert — only when `AcmCertificateArn` is empty | Cert generator Lambda | Operators (to distribute the cert to clients) |
+| `/aig/<stack>/<instance-id>` | SSM Parameter (`String`) | AIG appliance ID in the Netskope tenant | AIG Activation Lambda at launch | AIG Activation Lambda at termination |
 
 ### Credential Flow
 
+**AIG (per instance launch):**
 ```
 1. User provides API token as NoEcho CloudFormation parameter
-2. CloudFormation creates <stack>-api-credentials in Secrets Manager
+2. CloudFormation creates <stack>-netskope-credentials in Secrets Manager
 3. ASG launches AIG instance → lifecycle hook → Activation Lambda fires
 4. Activation Lambda reads API token from Secrets Manager (encrypted in transit, AWS SDK TLS)
 5. Activation Lambda calls Netskope REST API → receives enrollment token (exists in Lambda memory only)
-6. Activation Lambda writes enrollment token to <stack>-aig-bootstrap (separate secret)
+6. Activation Lambda reads the DLPoD CA cert from SSM and writes enrollment token + DLP block
+   to <stack>-aig-bootstrap (separate secret)
 7. AIG instance reads bootstrap secret at boot over HTTPS → self-enrolls
 8. Enrollment token is consumed; it is not persisted beyond the bootstrap secret write
 ```
 
-The API token (`<stack>-api-credentials`) and the enrollment token (`<stack>-aig-bootstrap`) are
-in separate secrets. Compromise of the bootstrap secret does not expose the API token.
+The API token (`<stack>-netskope-credentials`) and the enrollment token (`<stack>-aig-bootstrap`)
+are in separate secrets. Compromise of the bootstrap secret does not expose the API token.
+
+**DLPoD (once, at stack creation or update):**
+```
+1. User provides license key as NoEcho CloudFormation parameter
+2. CloudFormation creates <stack>-dlpod-credentials in Secrets Manager
+3. CertGeneratorFunction (<stack>-certgen) generates a CA + leaf cert for dlp.aigw.internal,
+   imports the leaf to ACM, writes the CA PEM to SSM /<stack>/dlpod-cert and the full
+   CA + leaf + private key to <stack>-dlpod-cert-key
+4. DlpodBootstrapBuilderFunction (<stack>-dlpod-bootstrap-builder) reads both secrets and
+   assembles bootstrap.json (TLS cert + key, license key, DNS 169.254.169.253, persona)
+5. The base64-encoded bootstrap.json becomes the DlpodLaunchTemplate UserData
+6. Every DLPoD instance's nsbootstrap.service applies bootstrap.json at first boot —
+   the instance never calls Secrets Manager or SSM
+```
+
+Because the license key and the DLPoD leaf private key are embedded in the launch template
+UserData, anyone with `ec2:DescribeLaunchTemplateVersions` on the account (or code running on the
+instance, via IMDSv2) can read them. See Known Limitations.
 
 ---
 
@@ -179,23 +238,28 @@ in separate secrets. Compromise of the bootstrap secret does not expose the API 
 
 | Path | Protocol | Notes |
 |---|---|---|
-| Internet → AIG ALB | TLS 1.2+ | Certificate from ACM (auto-generated or user-provided) |
+| Internet → AIG ALB | TLS (ALB default security policy) | Certificate from ACM (auto-generated self-signed or user-provided). No `SslPolicy` is set on the listener; add one to enforce TLS 1.2+ only |
 | AIG ALB → AIG instances | TLS (HTTPS:443) | ALB health checks and traffic forwarding |
-| AIG instances → DLPoD ALB | TLS (HTTPS:443) | Self-signed cert; AIG trusts cert via bootstrap secret |
-| DLPoD ALB → DLPoD instances | TLS (HTTPS:443) | |
-| DLPoD instances → Netskope management plane | TLS (HTTPS:443) | Tethering callhome |
-| Lambda → Secrets Manager / SSM | TLS (AWS SDK) | All AWS SDK calls use TLS |
+| AIG instances → DLPoD ALB | TLS (HTTPS:443) | Stack-generated leaf cert signed by a stack-generated CA; AIG trusts the CA via `dlp.certificate` in the bootstrap secret |
+| DLPoD ALB → DLPoD instances | TLS (HTTPS:443) | DLPoD serves the same leaf cert + key delivered in `bootstrap.json` |
+| DLPoD instances → Netskope management plane | TLS (HTTPS:443) | Outbound via NAT Gateway after licensing |
+| AIG instances → Guardrails ALB → Guardrails instances *(if deployed)* | HTTP (`GuardrailsContainerPort`) | Plain HTTP inside private subnets — see Known Limitations |
+| Lambda → Secrets Manager / SSM / ACM / ELBv2 | TLS (AWS SDK) | All AWS SDK calls use TLS |
 | Lambda → Netskope REST API | TLS (HTTPS:443) | AIG enrollment and deregistration |
-| DLPoD Lambda → DLPoD instance | SSH (port 22) | Tethering automation; password-based (see Known Limitations) |
+
+No component of the stack uses SSH. Guardrails instances are reachable for diagnostics only via
+SSM Session Manager (`AmazonSSMManagedInstanceCore`), which is IAM-authenticated and logged in
+CloudTrail; AIG and DLPoD instance roles do not include Session Manager.
 
 ### At Rest
 
 | Resource | Encryption |
 |---|---|
-| Secrets Manager secrets | AES-256, AWS-managed KMS key (default) |
-| SSM Parameter Store parameters | AES-256, AWS-managed KMS key (SecureString type) |
-| EBS root volumes | Encrypted if the AWS account has default EBS encryption enabled; not explicitly enforced by the template |
+| Secrets Manager secrets | AES-256, AWS-managed KMS key (`aws/secretsmanager`) |
+| SSM Parameter Store parameters | `String` type — hold only public certificate PEMs and appliance IDs; no private keys or credentials are stored in SSM |
+| EBS root volumes (AIG, DLPoD, Guardrails) | `Encrypted: true` set explicitly in all three launch templates (AWS-managed EBS key unless the account default key is customer-managed) |
 | CloudWatch Logs | Encrypted at rest by default (AWS-managed) |
+| Launch template UserData (DLPoD) | Stored by EC2; not separately encrypted — contains the DLPoD TLS key and license key (see Known Limitations) |
 
 ---
 
@@ -204,31 +268,44 @@ in separate secrets. Compromise of the bootstrap secret does not expose the API 
 ✅ **`NoEcho: true`** on all sensitive parameters (`NetskopeApiToken`, `DlpodLicenseKey`) — values
 are never shown in CloudFormation events, stack output, or the console.
 
-✅ **Resource-scoped IAM policies** — No `Resource: "*"` on sensitive actions. Secrets Manager
-and SSM access is scoped to specific resource ARNs constructed with `!Sub`.
+✅ **Resource-scoped IAM policies** — Secrets Manager, SSM, SNS, and Auto Scaling access is scoped
+to specific resource ARNs constructed with `!Ref` / `!Sub`. The only `Resource: "*"` grants are on
+actions that cannot be ARN-scoped (`ec2:DescribeInstances`, `elasticloadbalancing:DescribeTargetHealth`,
+`acm:ImportCertificate`).
 
-✅ **No secrets in user data** — AIG instance user data is empty. The instance reads its
-configuration from Secrets Manager at boot using its IAM role.
+✅ **No secrets in AIG user data** — AIG instance user data contains only the bootstrap secret
+*name* (`{"bootstrap_secret": "<stack>-aig-bootstrap"}`). The instance reads the value from
+Secrets Manager at boot using its IAM role.
 
-✅ **No secrets in Lambda environment variables** — Lambda functions retrieve credentials at
-runtime from Secrets Manager using the execution role. Credentials are not present in the
-function configuration.
+✅ **No secrets in Lambda environment variables** — The Activation Lambda's environment holds only
+ARNs, parameter names, and host names. Credentials are retrieved at runtime from Secrets Manager
+using the execution role. The other three Lambdas have no environment variables at all.
 
-✅ **Separate secrets for separate purposes** — API credentials (`<stack>-api-credentials`),
-bootstrap data (`<stack>-aig-bootstrap`), and license key (`<stack>-dlpod-credentials`) are
-in separate Secrets Manager secrets with separate access controls.
+✅ **All Lambda code is inline** — Every function uses `ZipFile` code embedded in the template. No
+external Lambda artifacts, layers, or S3 code buckets are fetched at deploy time, so the reviewed
+template is the complete supply chain. (An S3 bucket is still used to *host the template itself*
+because it exceeds the 51 KB `--template-body` limit.)
 
-✅ **Conditions prevent unnecessary resource creation** — `UseAutoGeneratedAigCert` condition
-avoids creating the cert generator invocation when a user-provided ACM ARN is given.
+✅ **Separate secrets for separate purposes** — API credentials (`<stack>-netskope-credentials`),
+bootstrap data (`<stack>-aig-bootstrap`), license key (`<stack>-dlpod-credentials`), and the
+DLPoD TLS key material (`<stack>-dlpod-cert-key`) are in separate Secrets Manager secrets with
+separate, role-specific access.
+
+✅ **IMDSv2 required** — All launch templates set `MetadataOptions.HttpTokens: required`.
+
+✅ **Conditions prevent unnecessary resource creation** — `UseAutoGeneratedAigCert` skips the AIG
+cert generation when a user-provided ACM ARN is given; `DeployGuardrails` creates the GPU tier
+(role, SGs, ALB, ASG) only when `GuardrailsImageS3Bucket` is set, and a template `Rules` assertion
+requires `GuardrailsAmiId` alongside it.
 
 ⚠️ **AIG ALB uses a self-signed certificate by default** — The auto-generated cert has
 `aig.aigw.internal` as its CN/SAN. API clients must be configured to trust it or skip TLS
 verification. For production deployments with external clients, provide a trusted ACM certificate
 via `AcmCertificateArn`. See [DEPLOYMENT.md — ACM Certificate](DEPLOYMENT.md#4-acm-certificate-optional).
 
-⚠️ **EBS encryption is not explicitly enforced by the template** — EBS root volumes are
-encrypted only if the AWS account has default EBS encryption enabled at the account level.
-Enable default EBS encryption in your account before deploying if this is required.
+⚠️ **DLPoD configuration travels in UserData** — The DLPoD `bootstrap.json` (TLS private key and
+license key) is base64-encoded, not encrypted, in the launch template. Restrict
+`ec2:DescribeLaunchTemplateVersions` and `ec2:DescribeInstanceAttribute` (userData) to operators.
 
 ---
 
@@ -238,10 +315,14 @@ Enable default EBS encryption in your account before deploying if this is requir
 
 | Log group | Contents | Retention |
 |---|---|---|
-| `/aws/lambda/<stack>-aig-activation` | AIG registration/deregistration with Netskope API, lifecycle hook events | 7 days |
-| `/aws/lambda/<stack>-dlpod-activation` | DLPoD ASG lifecycle events, Step Functions execution start | 7 days |
-| `/aws/lambda/<stack>-dlpod` | DLPoD tethering SSH automation steps, license application, tethering status | 7 days |
-| `/aws/lambda/<stack>-cert-generator` | Self-signed cert generation, ACM import, SSM parameter writes | 7 days |
+| `/aws/lambda/<stack>-aig-activation` | AIG registration/deregistration with Netskope API, lifecycle hook events | 30 days |
+| `/aws/lambda/<stack>-certgen` | Cert hierarchy generation, ACM import, SSM and Secrets Manager writes (stack create/delete only) | 30 days |
+| `/aws/lambda/<stack>-dlpod-bootstrap-builder` | `bootstrap.json` assembly — logs sizes only, never contents (stack create/update only) | 30 days |
+| `/aws/lambda/<stack>-dlpod-readiness` | Readiness gate polls (`N/M target(s) healthy`) for DLPoD and, if deployed, Guardrails (stack create only) | 7 days |
+
+DLPoD appliances do not write CloudWatch logs from the stack's perspective; `nsbootstrap.service`
+status is observable through DLPoD ALB target health or on the appliance per the Netskope DLP On
+Demand documentation.
 
 ### Netskope Audit Log
 
@@ -251,10 +332,16 @@ the Netskope management plane. Access logs from the Netskope UI under
 
 ### What to Monitor
 
-- Lambda function errors → CloudWatch Metrics → filter on `Errors` for each log group
-- AIG enrollment failures → check `/aws/lambda/<stack>-aig-activation` for `ERROR` lines
-- DLPoD tethering failures → Step Functions console → look for `FAILED` executions
-- ALB target health → `aws elbv2 describe-target-health` — unhealthy targets indicate enrollment/tethering problems
+- Lambda function errors → CloudWatch Metrics → filter on `Errors` for each function
+- AIG enrollment failures → check `/aws/lambda/<stack>-aig-activation` for `Traceback` / `ABANDON` lines
+- DLPoD bootstrap failures → DLPoD ALB target health (`aws elbv2 describe-target-health`); a target
+  that never becomes healthy within the 30-minute ASG grace period indicates `nsbootstrap` did not
+  complete (bad license key, no outbound path) — see [TROUBLESHOOTING.md](TROUBLESHOOTING.md#dlp-on-demand-issues)
+- Stack rollback at `DlpodReadinessGate` / `GuardrailsReadinessGate` → `describe-stack-events` and
+  `/aws/lambda/<stack>-dlpod-readiness`
+- ALB target health → `aws elbv2 describe-target-health` — unhealthy targets indicate enrollment/bootstrap problems
+- CloudTrail → `secretsmanager:GetSecretValue` on `<stack>-netskope-credentials` from any principal
+  other than `<stack>-aig-activation-role`; `ec2:DescribeLaunchTemplateVersions` on `<stack>-dlpod-lt`
 
 ---
 
@@ -262,7 +349,9 @@ the Netskope management plane. Access logs from the Netskope UI under
 
 | Item | Detail | Mitigation |
 |---|---|---|
-| DLPoD tethering uses password-based SSH | The tethering Lambda connects to DLPoD via SSH with a randomly generated 24-character password. The password is held in Step Functions execution state during tethering and discarded afterward. | Password is unique per instance, randomly generated, and not persisted after tethering completes. Network path is restricted to the DLPoD Lambda SG → DLPoD instance SG (port 22 only). |
+| DLPoD TLS private key and license key are in launch template UserData | `bootstrap.json` (leaf cert + private key for `dlp.aigw.internal`, DLPoD license key) is base64-encoded into `<stack>-dlpod-lt` UserData so `nsbootstrap.service` can apply it at first boot with no credentials on the instance. UserData is readable by any principal with `ec2:DescribeLaunchTemplateVersions` / `ec2:DescribeInstanceAttribute`, and by code on the instance via IMDSv2. | The key is stack-generated, valid 365 days, and only ever trusted by this stack's AIG instances for `dlp.aigw.internal` (an internal-only ALB). Restrict launch-template read permissions to operators; a stack update that re-runs `DlpodAlbCertificate` regenerates the hierarchy. |
+| AIG → Guardrails traffic is plain HTTP | The AIG bootstrap `ai_guardrails` block carries a host only (no certificate field), so the Guardrails internal ALB listens on HTTP. Prompts and responses under inspection traverse this hop unencrypted. | Path is confined to private subnets and restricted by security group to AIG instances → Guardrails ALB → Guardrails instances; no internet or cross-VPC exposure. If a future AIG build accepts `ai_guardrails.certificate`, switch the listener to HTTPS using the existing `Custom::AlbCertificate` pattern. |
 | Auto-generated AIG ALB cert is self-signed | CN/SAN is `aig.aigw.internal`, which does not resolve publicly. Clients must trust the cert or skip TLS verification. | Provide a valid ACM certificate via `AcmCertificateArn` for production deployments where clients require trusted TLS. |
-| EBS encryption not explicitly enforced | The template does not set `Encrypted: true` on the EC2 launch template EBS volumes. | Enable AWS account-level default EBS encryption (`aws ec2 enable-ebs-encryption-by-default`) before deploying. |
-| Secrets Manager secrets deleted on stack teardown | Deleting the stack permanently deletes all Secrets Manager secrets including API credentials. | If you need to preserve credentials, remove them from the template's `DeletionPolicy` before deploying, or back up secret values before teardown. |
+| Shared AIG bootstrap secret | Every AIG launch overwrites `<stack>-aig-bootstrap` with that instance's enrollment token; two AIG instances launching concurrently can read each other's token. | Scale AIG one instance at a time (the CPU scale-out policy adds +1 per alarm). The DLP / Guardrails blocks are identical for all instances and unaffected. |
+| Stack-generated certificates expire after 365 days | The DLPoD CA + leaf (and the auto-generated AIG ALB cert) are valid for one year from stack creation. AIG → DLPoD TLS fails after expiry. | Plan a stack update that re-runs `DlpodAlbCertificate` and an instance refresh before expiry — see [OPERATIONS.md](OPERATIONS.md#secrets-and-ssm-parameters). |
+| Secrets Manager secrets deleted on stack teardown | Deleting the stack permanently deletes all Secrets Manager secrets including API credentials. | If you need to preserve credentials, add a `DeletionPolicy: Retain` to the secret resources before deploying, or back up secret values before teardown. |
